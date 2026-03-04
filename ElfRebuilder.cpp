@@ -410,7 +410,11 @@ bool ElfRebuilder::RebuildShdr() {
         shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
         shdr.sh_addr = shdrs[sLast].sh_addr + shdrs[sLast].sh_size;
         shdr.sh_offset = shdr.sh_addr;
-        shdr.sh_size = si.max_load - shdr.sh_addr;
+        if (si.max_load > shdr.sh_addr) {
+            shdr.sh_size = si.max_load - shdr.sh_addr;
+        } else {
+            shdr.sh_size = 0;
+        }
         shdr.sh_link = 0;
         shdr.sh_info = 0;
         shdr.sh_addralign = 4;
@@ -574,7 +578,11 @@ bool ElfRebuilder::ReadSoInfo() {
     // Extract useful information from dynamic section.
     uint32_t needed_count = 0;
     size_t plt_rel_size_bytes = 0;
-    for (Elf_Dyn* d = si.dynamic; d->d_tag != DT_NULL; ++d) {
+    for (size_t dyn_idx = 0; dyn_idx < si.dynamic_count; ++dyn_idx) {
+        Elf_Dyn* d = si.dynamic + dyn_idx;
+        if (d->d_tag == DT_NULL) {
+            break;
+        }
         switch(d->d_tag){
             case DT_HASH:
                 si.hash = d->d_un.d_ptr + (uint8_t*)base;
@@ -749,6 +757,7 @@ bool ElfRebuilder::RebuildFin() {
 template <bool isRela>
 void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
     if(rel == nullptr) return ;
+    if (si.max_load < sizeof(Elf_Addr)) return;
     if (rel->r_offset < si.min_load) return;
     if (rel->r_offset > si.max_load - sizeof(Elf_Addr)) return;
 #ifndef __SO64__

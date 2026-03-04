@@ -188,8 +188,10 @@ bool ElfReader::ReadProgramHeader() {
 
     phdr_size_ = phdr_num_ * sizeof(Elf_Phdr);
     void* mmap_result = new uint8_t[phdr_size_];
-    if(!source_->Read(mmap_result, phdr_size_, header_.e_phoff)) {
+    auto rc = source_->Read(mmap_result, phdr_size_, header_.e_phoff);
+    if (rc != phdr_size_) {
         FLOGE("\"%s\" has no valid phdr data", name_);
+        delete [](uint8_t*)mmap_result;
         return false;
     }
 
@@ -296,16 +298,28 @@ bool ElfReader::LoadSegments() {
 
         // Segment addresses in memory.
         Elf_Addr seg_start = phdr->p_vaddr;
-        Elf_Addr seg_end   = seg_start + phdr->p_memsz;
+        Elf_Addr seg_end = seg_start + phdr->p_memsz;
+        if (seg_end < seg_start) {
+            FLOGE("\"%s\" invalid segment range at phdr %zu", name_, i);
+            return false;
+        }
 
 //        Elf_Addr seg_page_start = PAGE_START(seg_start);
 //        Elf_Addr seg_page_end   = PAGE_END(seg_end);
 
-        Elf_Addr seg_file_end   = seg_start + phdr->p_filesz;
+        Elf_Addr seg_file_end = seg_start + phdr->p_filesz;
+        if (seg_file_end < seg_start) {
+            FLOGE("\"%s\" invalid segment file range at phdr %zu", name_, i);
+            return false;
+        }
 
         // File offsets.
         Elf_Addr file_start = phdr->p_offset;
-        Elf_Addr file_end   = file_start + phdr->p_filesz;
+        Elf_Addr file_end = file_start + phdr->p_filesz;
+        if (file_end < file_start) {
+            FLOGE("\"%s\" invalid file range at phdr %zu", name_, i);
+            return false;
+        }
 
 //        Elf_Addr file_page_start = PAGE_START(file_start);
         Elf_Addr file_length = file_end - file_start;
@@ -314,7 +328,8 @@ bool ElfReader::LoadSegments() {
         if (file_length != 0) {
             // memory data loading
             void* load_point = seg_start + reinterpret_cast<uint8_t *>(load_bias_);
-            if(!source_->Read(load_point, file_length, file_start)) {
+            auto read_size = source_->Read(load_point, file_length, file_start);
+            if (read_size != file_length) {
                 FLOGE("couldn't map \"%s\" segment %zu: %s", name_, i, strerror(errno));
                 return false;
             }
@@ -622,7 +637,11 @@ bool ElfReader::CheckPhdr(uint8_t * loaded) {
             continue;
         }
         auto seg_start = phdr->p_vaddr + (uint8_t*)load_bias_;
-        auto seg_end = phdr->p_filesz + seg_start;
+        auto seg_size = phdr->p_memsz;
+        if (phdr->p_filesz > seg_size) {
+            seg_size = phdr->p_filesz;
+        }
+        auto seg_end = seg_size + seg_start;
         if (seg_start <= loaded && loaded_end <= seg_end) {
             loaded_phdr_ = reinterpret_cast<const Elf_Phdr*>(loaded);
             return true;

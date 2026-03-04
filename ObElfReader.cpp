@@ -8,6 +8,7 @@
 
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 void ObElfReader::FixDumpSoPhdr() {
     // some shell will release data between loadable phdr(s), just load all memory data
@@ -136,9 +137,17 @@ bool ObElfReader::LoadDynamicSectionFromBaseSource() {
             continue;
         }
 
+        if (phdr->p_memsz == 0) {
+            return false;
+        }
         dynamic_sections_ = new uint8_t [phdr->p_memsz];
-        auto read_size = base_reader.source_->Read(dynamic_sections_, phdr->p_memsz, phdr->p_offset);
-        if (read_size != phdr->p_memsz) {
+        memset(dynamic_sections_, 0, phdr->p_memsz);
+        size_t load_size = phdr->p_filesz;
+        if (load_size > phdr->p_memsz) {
+            load_size = phdr->p_memsz;
+        }
+        auto read_size = base_reader.source_->Read(dynamic_sections_, load_size, phdr->p_offset);
+        if (read_size != load_size) {
             delete [](uint8_t*)dynamic_sections_;
             dynamic_sections_ = nullptr;
             return false;
