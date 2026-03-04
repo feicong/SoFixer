@@ -184,7 +184,11 @@ bool ElfRebuilder::RebuildShdr() {
         }
         shstrtab.push_back('\0');
 
-        shdr.sh_type = SHT_REL;
+        if (si.plt_type == DT_REL) {
+            shdr.sh_type = SHT_REL;
+        } else {
+            shdr.sh_type = SHT_RELA;
+        }
         shdr.sh_flags = SHF_ALLOC;
         shdr.sh_addr = (uintptr_t)si.plt_rel - (uintptr_t)base;
         shdr.sh_offset = shdr.sh_addr;
@@ -195,12 +199,15 @@ bool ElfRebuilder::RebuildShdr() {
         }
         shdr.sh_link = sDYNSYM;
         shdr.sh_info = 0;
+        if (si.plt_type == DT_REL) {
+            shdr.sh_entsize = sizeof(Elf_Rel);
+        } else {
+            shdr.sh_entsize = sizeof(Elf_Rela);
+        }
 #ifdef __SO64__
         shdr.sh_addralign = 8;
-        shdr.sh_entsize = 0x18;
 #else
         shdr.sh_addralign = 4;
-        shdr.sh_entsize = 0x8;
 #endif
 
         shdrs.push_back(shdr);
@@ -566,6 +573,7 @@ bool ElfRebuilder::ReadSoInfo() {
 
     // Extract useful information from dynamic section.
     uint32_t needed_count = 0;
+    size_t plt_rel_size_bytes = 0;
     for (Elf_Dyn* d = si.dynamic; d->d_tag != DT_NULL; ++d) {
         switch(d->d_tag){
             case DT_HASH:
@@ -591,8 +599,7 @@ bool ElfRebuilder::ReadSoInfo() {
                 FLOGD("%s plt_rel (DT_JMPREL) found at %" ADDRESS_FORMAT "x", si.name, d->d_un.d_ptr);
                 break;
             case DT_PLTRELSZ:
-                si.plt_rel_count = d->d_un.d_val / sizeof(Elf_Rel);
-                FLOGD("%s plt_rel_count (DT_PLTRELSZ) %zu", si.name, si.plt_rel_count);
+                plt_rel_size_bytes = d->d_un.d_val;
                 break;
             case DT_REL:
                 si.rel = (Elf_Rel*) (base + d->d_un.d_ptr);
@@ -700,6 +707,14 @@ bool ElfRebuilder::ReadSoInfo() {
                 break;
         }
     }
+    if (plt_rel_size_bytes != 0) {
+        if (si.plt_type == DT_RELA) {
+            si.plt_rel_count = plt_rel_size_bytes / sizeof(Elf_Rela);
+        } else {
+            si.plt_rel_count = plt_rel_size_bytes / sizeof(Elf_Rel);
+        }
+        FLOGD("%s plt_rel_count (DT_PLTRELSZ) %zu", si.name, si.plt_rel_count);
+    }
     FLOGD("=======================ReadSoInfo End=========================");
     return true;
 }
@@ -720,11 +735,6 @@ bool ElfRebuilder::RebuildFin() {
            shdrs.size() * sizeof(Elf_Shdr));
     auto ehdr = *elf_reader_->record_ehdr();
     ehdr.e_type = ET_DYN;
-#ifdef __SO64__
-    ehdr.e_machine = 183;
-#else
-    ehdr.e_machine = 40;
-#endif
     ehdr.e_shnum = shdrs.size();
     ehdr.e_shoff = (Elf_Addr)shdr_off;
     ehdr.e_shstrndx = sSHSTRTAB;
@@ -749,8 +759,14 @@ void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
         // I don't known other so info, if i want to fix it, I must dump other so file
         case R_386_RELATIVE:
         case R_ARM_RELATIVE:
-            *prel = *prel - dump_base;
+            if (*prel >= dump_base) {
+                *prel = *prel - dump_base;
+            }
             break;
+        case R_386_GLOB_DAT:
+        case R_386_JMP_SLOT:
+        case R_ARM_GLOB_DAT:
+        case R_ARM_JUMP_SLOT:
         case 0x401: //看到也有该type的重定位信息，其中也是导入表相关内容，所以这里也加上
         case 0x402:{
             auto syminfo = si.symtab[sym];
@@ -762,10 +778,12 @@ void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
                 *prel = load_size + external_pointer;
                 external_pointer += sizeof(*prel);
               }else{ //这里如果获取了导入符号内容，并且不为空，则从保存的导入符号数组中获取导入表索引值
-                const char* symname = si.strtab + syminfo.st_name;
-                int nIndex = GetIndexOfImports(symname);
+                int nIndex = GetImportSlotBySymIndex(sym);
                 if (nIndex != -1){
                   *prel = load_size + nIndex*sizeof(*prel);
+                } else {
+                  *prel = load_size + external_pointer;
+                  external_pointer += sizeof(*prel);
                 }
 //                FLOGD("type:0x%x offset:0x%x -- symname:%s nIndex:%d\r\n", type, rel->r_offset, symname, nIndex);
               }
@@ -787,42 +805,86 @@ void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
     }
 };
 
-int ElfRebuilder::GetIndexOfImports(std::string stringSymName){
-  int nIndex = 0;
-  for (auto& it : mImports){
-    std::string strImport = it;
-    if (strImport == stringSymName){
-      return nIndex;
+int ElfRebuilder::GetImportSlotBySymIndex(size_t symIndex) const {
+    auto it = mImportSymIndexToImportSlot.find(symIndex);
+    if (it == mImportSymIndexToImportSlot.end()) {
+        return -1;
     }
-    nIndex++;
-  }
-  return -1;
+    return static_cast<int>(it->second);
 }
 
 
 //将导入表的符号按顺序保存在 std::vector<std::string>  mImports; 中，以便后面获得导入符号序号 
 void ElfRebuilder::SaveImportsymNames(){
-  Elf_Sym* symtab = si.symtab;
-  const char* strtab = si.strtab;
-  int nIndex = 0;
-  bool start = false;
-  while (true){
-    Elf_Sym sym = symtab[nIndex];
-    if (sym.st_name == 0 && !start){
-      nIndex++;
-      continue;
+    mImports.clear();
+    mImportSymIndexToImportSlot.clear();
+    if (si.symtab == nullptr || si.strtab == nullptr) {
+        return;
     }
-    start = true;
-    if (sym.st_name != 0 && sym.st_value!=0){
-      //开始进到非导入表的符号，退出
-      break;
-    }
-    const char* symname = strtab + sym.st_name;
-    mImports.push_back(symname);
-//    FLOGD("NO:%d %s \r\n", nIndex, symname);
-    nIndex++;
-  }
 
+    size_t max_sym_index = 0;
+    auto update_max_sym_rel = [&max_sym_index](Elf_Rel* rel, size_t count) {
+        if (rel == nullptr || count == 0) {
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+#ifndef __SO64__
+            auto sym = static_cast<size_t>(ELF32_R_SYM(rel[i].r_info));
+#else
+            auto sym = static_cast<size_t>(ELF64_R_SYM(rel[i].r_info));
+#endif
+            if (sym > max_sym_index) {
+                max_sym_index = sym;
+            }
+        }
+    };
+    auto update_max_sym_rela = [&max_sym_index](Elf_Rela* rela, size_t count) {
+        if (rela == nullptr || count == 0) {
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+#ifndef __SO64__
+            auto sym = static_cast<size_t>(ELF32_R_SYM(rela[i].r_info));
+#else
+            auto sym = static_cast<size_t>(ELF64_R_SYM(rela[i].r_info));
+#endif
+            if (sym > max_sym_index) {
+                max_sym_index = sym;
+            }
+        }
+    };
+
+    update_max_sym_rel(si.rel, si.rel_count);
+    update_max_sym_rela(si.plt_rela, si.plt_rela_count);
+    if (si.plt_type == DT_RELA) {
+        update_max_sym_rela(reinterpret_cast<Elf_Rela*>(si.plt_rel), si.plt_rel_count);
+    } else {
+        update_max_sym_rel(si.plt_rel, si.plt_rel_count);
+    }
+
+    size_t symbol_scan_limit = max_sym_index + 1;
+    if (si.nchain > symbol_scan_limit) {
+        symbol_scan_limit = si.nchain;
+    }
+    if (si.mips_symtabno > symbol_scan_limit) {
+        symbol_scan_limit = si.mips_symtabno;
+    }
+
+    for (size_t nIndex = 0; nIndex < symbol_scan_limit; ++nIndex) {
+        const Elf_Sym& sym = si.symtab[nIndex];
+        if (sym.st_name == 0) {
+            continue;
+        }
+        if (sym.st_shndx != SHN_UNDEF) {
+            continue;
+        }
+        const char* symname = si.strtab + sym.st_name;
+        if (symname == nullptr || *symname == '\0') {
+            continue;
+        }
+        mImportSymIndexToImportSlot[nIndex] = mImports.size();
+        mImports.emplace_back(symname);
+    }
 }
 
 
@@ -833,23 +895,25 @@ bool ElfRebuilder::RebuildRelocs() {
 
     if(elf_reader_->dump_so_base_ == 0) return true;
     FLOGD("=======================RebuildRelocs=========================");
+    auto rel = si.rel;
+    for (size_t i = 0; i < si.rel_count; i++, rel++) {
+        relocate<false>(si.load_bias, rel, elf_reader_->dump_so_base_);
+    }
+
+    auto rela = reinterpret_cast<Elf_Rela*>(si.plt_rela);
+    for (size_t i = 0; i < si.plt_rela_count; i++, rela++) {
+        relocate<true>(si.load_bias, reinterpret_cast<Elf_Rel*>(rela), elf_reader_->dump_so_base_);
+    }
+
     if (si.plt_type == DT_REL) {
-        auto rel = si.rel;
-        for (auto i = 0; i < si.rel_count; i++, rel++){
-            relocate<false>(si.load_bias, rel, elf_reader_->dump_so_base_);
-        }
         rel = si.plt_rel;
-        for (auto i = 0; i < si.plt_rel_count; i++, rel++){
+        for (size_t i = 0; i < si.plt_rel_count; i++, rel++) {
             relocate<false>(si.load_bias, rel, elf_reader_->dump_so_base_);
         }
     } else {
-        auto rel = (Elf_Rela*)si.plt_rela;
-        for (auto i = 0; i <si.plt_rela_count; i++, rel ++) {
-            relocate<true>(si.load_bias, (Elf_Rel*)rel, elf_reader_->dump_so_base_);
-        }
-        rel = (Elf_Rela*) si.plt_rel;
-        for (auto i = 0; i < si.plt_rel_count; i++, rel++){
-            relocate<true>(si.load_bias, (Elf_Rel*)rel, elf_reader_->dump_so_base_);
+        rela = reinterpret_cast<Elf_Rela*>(si.plt_rel);
+        for (size_t i = 0; i < si.plt_rel_count; i++, rela++) {
+            relocate<true>(si.load_bias, reinterpret_cast<Elf_Rel*>(rela), elf_reader_->dump_so_base_);
         }
     }
     auto relocate_address = [](Elf_Addr * pelf, Elf_Addr dump_base){
@@ -861,7 +925,3 @@ bool ElfRebuilder::RebuildRelocs() {
     FLOGD("=======================RebuildRelocs End=======================");
     return true;
 }
-
-
-
-

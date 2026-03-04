@@ -28,10 +28,18 @@ void ObElfReader::FixDumpSoPhdr() {
                 if (i != total - 1) {
                     // to next loaded segament
                     auto nphdr = loaded_phdrs[i+1];
-                    phdr->p_memsz = nphdr->p_vaddr - phdr->p_vaddr;
+                    if (nphdr->p_vaddr > phdr->p_vaddr) {
+                        phdr->p_memsz = nphdr->p_vaddr - phdr->p_vaddr;
+                    } else {
+                        phdr->p_memsz = 0;
+                    }
                 } else {
                     // to the file end
-                    phdr->p_memsz = file_size - phdr->p_vaddr;
+                    if (file_size > phdr->p_vaddr) {
+                        phdr->p_memsz = file_size - phdr->p_vaddr;
+                    } else {
+                        phdr->p_memsz = 0;
+                    }
                 }
                 phdr->p_filesz = phdr->p_memsz;
             }
@@ -129,7 +137,12 @@ bool ObElfReader::LoadDynamicSectionFromBaseSource() {
         }
 
         dynamic_sections_ = new uint8_t [phdr->p_memsz];
-        base_reader.source_->Read(dynamic_sections_, phdr->p_memsz, phdr->p_offset);
+        auto read_size = base_reader.source_->Read(dynamic_sections_, phdr->p_memsz, phdr->p_offset);
+        if (read_size != phdr->p_memsz) {
+            delete [](uint8_t*)dynamic_sections_;
+            dynamic_sections_ = nullptr;
+            return false;
+        }
 
         dynamic_count_ = (unsigned)(phdr->p_memsz / sizeof(Elf_Dyn));
         dynamic_flags_ = phdr->p_flags;
@@ -163,9 +176,6 @@ void ObElfReader::ApplyDynamicSection() {
 }
 
 bool ObElfReader::haveDynamicSectionInLoadableSegment() {
-    Elf_Addr min_vaddr, max_vaddr;
-    phdr_table_get_load_size(phdr_table_, phdr_num_, &min_vaddr, &max_vaddr);
-
     const Elf_Phdr* phdr = phdr_table_;
     const Elf_Phdr* phdr_limit = phdr + phdr_num_;
 
@@ -173,11 +183,26 @@ bool ObElfReader::haveDynamicSectionInLoadableSegment() {
         if (phdr->p_type != PT_DYNAMIC) {
             continue;
         }
-        if (phdr->p_vaddr > min_vaddr && (phdr->p_vaddr + phdr->p_memsz) < max_vaddr) {
-            return true;
+        Elf_Addr dyn_start = phdr->p_vaddr;
+        Elf_Addr dyn_end = dyn_start + phdr->p_memsz;
+        if (dyn_end < dyn_start) {
+            break;
+        }
+
+        for (const Elf_Phdr* load = phdr_table_; load < phdr_limit; load++) {
+            if (load->p_type != PT_LOAD) {
+                continue;
+            }
+            Elf_Addr load_start = load->p_vaddr;
+            Elf_Addr load_end = load_start + load->p_memsz;
+            if (load_end < load_start) {
+                continue;
+            }
+            if (dyn_start >= load_start && dyn_end <= load_end) {
+                return true;
+            }
         }
         break;
     }
     return false;
 }
-

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <unordered_map>
 #include "ObElfReader.h"
 
 
@@ -104,9 +105,10 @@ private:
     bool RebuildFin();
 
     //新增以下三个导入符号相关属性，以修复导入表的索引错乱的问题
-    int GetIndexOfImports(std::string stringSymName);
+    int GetImportSlotBySymIndex(size_t symIndex) const;
     void SaveImportsymNames();
     std::vector<std::string>  mImports;
+    std::unordered_map<size_t, size_t> mImportSymIndexToImportSlot;
 
   template <bool isRela>
   void relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base);
