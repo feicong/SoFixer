@@ -138,7 +138,7 @@ private:
     std::vector<Elf_Shdr> shdrs;
     std::string shstrtab;
 
-  unsigned external_pointer = 0;
+  Elf_Addr external_pointer = 0;
 private:
     bool isPatchInit = false;
 public:

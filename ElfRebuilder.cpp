@@ -19,6 +19,16 @@
 #define ADDRESS_FORMAT ""
 #endif
 
+#ifndef R_AARCH64_GLOB_DAT
+#define R_AARCH64_GLOB_DAT 1025
+#endif
+#ifndef R_AARCH64_JUMP_SLOT
+#define R_AARCH64_JUMP_SLOT 1026
+#endif
+#ifndef R_AARCH64_RELATIVE
+#define R_AARCH64_RELATIVE 1027
+#endif
+
 namespace {
 bool AddElfAddr(Elf_Addr lhs, Elf_Addr rhs, Elf_Addr* out) {
     if (lhs > std::numeric_limits<Elf_Addr>::max() - rhs) {
@@ -93,6 +103,26 @@ bool CountToBytes(size_t count, size_t elem_size, Elf_Addr* out_bytes) {
     }
     *out_bytes = static_cast<Elf_Addr>(bytes);
     return true;
+}
+
+bool IsRelativeRelocType(Elf_Addr type) {
+    return type == R_386_RELATIVE ||
+           type == R_ARM_RELATIVE ||
+           type == R_X86_64_RELATIVE ||
+           type == R_AARCH64_RELATIVE;
+}
+
+bool IsImportRelocType(Elf_Addr type) {
+    return type == R_386_GLOB_DAT ||
+           type == R_386_JMP_SLOT ||
+           type == R_ARM_GLOB_DAT ||
+           type == R_ARM_JUMP_SLOT ||
+           type == R_X86_64_GLOB_DAT ||
+           type == R_X86_64_JUMP_SLOT ||
+           type == R_AARCH64_GLOB_DAT ||
+           type == R_AARCH64_JUMP_SLOT ||
+           type == 0x401 ||
+           type == 0x402;
 }
 }
 
@@ -192,8 +222,20 @@ bool ElfRebuilder::RebuildShdr() {
 
         shdr.sh_addr = si.hash - base;
         shdr.sh_offset = shdr.sh_addr;
-        // TODO 32bit, 64bit?
-        shdr.sh_size = (si.nbucket + si.nchain) * sizeof(Elf_Addr) + 2 * sizeof(Elf_Addr);
+        Elf_Addr hash_word_count = 0;
+        if (!AddElfAddr(static_cast<Elf_Addr>(si.nbucket),
+                        static_cast<Elf_Addr>(si.nchain),
+                        &hash_word_count) ||
+            !AddElfAddr(hash_word_count, 2, &hash_word_count)) {
+            FLOGE("Invalid hash table size");
+            return false;
+        }
+        Elf_Addr hash_size = 0;
+        if (!CountToBytes(static_cast<size_t>(hash_word_count), sizeof(Elf_Word), &hash_size)) {
+            FLOGE("Invalid hash table bytes");
+            return false;
+        }
+        shdr.sh_size = hash_size;
         shdr.sh_link = sDYNSYM;
         shdr.sh_info = 0;
         shdr.sh_addralign = 4;
@@ -608,11 +650,19 @@ bool ElfRebuilder::RebuildShdr() {
 
     if(sDYNSYM != 0) {
         auto sNext = sDYNSYM + 1;
+        if (sNext >= shdrs.size() || shdrs[sNext].sh_addr < shdrs[sDYNSYM].sh_addr) {
+            FLOGE("Invalid dynsym section order");
+            return false;
+        }
         shdrs[sDYNSYM].sh_size = shdrs[sNext].sh_addr - shdrs[sDYNSYM].sh_addr;
     }
 
     if(sTEXTTAB != 0) {
         auto sNext = sTEXTTAB + 1;
+        if (sNext >= shdrs.size() || shdrs[sNext].sh_addr < shdrs[sTEXTTAB].sh_addr) {
+            FLOGE("Invalid text section order");
+            return false;
+        }
         shdrs[sTEXTTAB].sh_size = shdrs[sNext].sh_addr - shdrs[sTEXTTAB].sh_addr;
     }
 
@@ -987,20 +1037,25 @@ void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
     auto prel = reinterpret_cast<Elf_Addr *>(base + rel->r_offset);
     switch (type) {
         // I don't known other so info, if i want to fix it, I must dump other so file
-        case R_386_RELATIVE:
-        case R_ARM_RELATIVE:
-            if (*prel >= dump_base) {
-                *prel = *prel - dump_base;
+        default:
+            if (IsRelativeRelocType(type)) {
+                if (*prel >= dump_base) {
+                    *prel = *prel - dump_base;
+                }
+                break;
             }
-            break;
-        case R_386_GLOB_DAT:
-        case R_386_JMP_SLOT:
-        case R_ARM_GLOB_DAT:
-        case R_ARM_JUMP_SLOT:
-        case 0x401: //看到也有该type的重定位信息，其中也是导入表相关内容，所以这里也加上
-        case 0x402:{
+            if (!IsImportRelocType(type)) {
+                break;
+            }
+            {
             auto apply_import_fallback = [&]() {
                 auto import_base = si.max_load;
+                if (external_pointer > std::numeric_limits<Elf_Addr>::max() - sizeof(*prel)) {
+                    return;
+                }
+                if (import_base > std::numeric_limits<Elf_Addr>::max() - external_pointer) {
+                    return;
+                }
                 *prel = import_base + external_pointer;
                 external_pointer += sizeof(*prel);
             };
@@ -1037,7 +1092,17 @@ void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
               }else{ //这里如果获取了导入符号内容，并且不为空，则从保存的导入符号数组中获取导入表索引值
                 int nIndex = GetImportSlotBySymIndex(sym);
                 if (nIndex != -1){
-                  *prel = import_base + nIndex*sizeof(*prel);
+                  const auto slot = static_cast<Elf_Addr>(nIndex);
+                  if (slot <= (std::numeric_limits<Elf_Addr>::max() / sizeof(*prel))) {
+                      const auto slot_addr = slot * sizeof(*prel);
+                      if (import_base <= std::numeric_limits<Elf_Addr>::max() - slot_addr) {
+                          *prel = import_base + slot_addr;
+                      } else {
+                          apply_import_fallback();
+                      }
+                  } else {
+                      apply_import_fallback();
+                  }
                 } else {
                   apply_import_fallback();
                 }
@@ -1045,14 +1110,13 @@ void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
               }
             }
             break;
-        }
-        default:
-            break;
+            }
     }
     if (isRela){
         Elf_Rela* rela = (Elf_Rela*)rel;
         switch (type){
-            case 0x403:
+            case R_AARCH64_RELATIVE:
+            case R_X86_64_RELATIVE:
                 *prel = rela->r_addend;
                 break;
             default:
