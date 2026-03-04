@@ -115,7 +115,7 @@ private:
     ObElfReader* elf_reader_;
     soinfo si;
 
-    int rebuild_size = 0;
+    size_t rebuild_size = 0;
     uint8_t * rebuild_data = nullptr;
 
     Elf_Word sDYNSYM = 0;

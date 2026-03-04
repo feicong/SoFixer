@@ -6,6 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include "ElfRebuilder.h"
 #include "elf.h"
 #include "FDebug.h"
@@ -16,6 +18,83 @@
 #else
 #define ADDRESS_FORMAT ""
 #endif
+
+namespace {
+bool AddElfAddr(Elf_Addr lhs, Elf_Addr rhs, Elf_Addr* out) {
+    if (lhs > std::numeric_limits<Elf_Addr>::max() - rhs) {
+        return false;
+    }
+    *out = lhs + rhs;
+    return true;
+}
+
+bool RangeInLoad(Elf_Addr start, Elf_Addr size, Elf_Addr min_load, Elf_Addr max_load) {
+    if (size == 0) {
+        return start >= min_load && start <= max_load;
+    }
+    if (start < min_load) {
+        return false;
+    }
+    Elf_Addr end = 0;
+    if (!AddElfAddr(start, size, &end)) {
+        return false;
+    }
+    return end >= start && end <= max_load;
+}
+
+bool PointerInLoad(const uint8_t* base,
+                   const void* ptr,
+                   size_t size,
+                   Elf_Addr min_load,
+                   Elf_Addr max_load) {
+    if (base == nullptr || ptr == nullptr) {
+        return false;
+    }
+    const auto base_addr = reinterpret_cast<uintptr_t>(base);
+    const auto ptr_addr = reinterpret_cast<uintptr_t>(ptr);
+    if (ptr_addr < base_addr) {
+        return false;
+    }
+    const auto offset = ptr_addr - base_addr;
+    if (offset > std::numeric_limits<Elf_Addr>::max()) {
+        return false;
+    }
+    if (size > static_cast<size_t>(std::numeric_limits<Elf_Addr>::max())) {
+        return false;
+    }
+    return RangeInLoad(static_cast<Elf_Addr>(offset),
+                       static_cast<Elf_Addr>(size),
+                       min_load,
+                       max_load);
+}
+
+bool StringOffsetValid(const char* strtab, size_t strtab_size, Elf_Word name_off) {
+    if (strtab == nullptr || strtab_size == 0) {
+        return false;
+    }
+    const auto name_index = static_cast<size_t>(name_off);
+    if (name_index >= strtab_size) {
+        return false;
+    }
+    const void* terminator = memchr(strtab + name_index, '\0', strtab_size - name_index);
+    return terminator != nullptr;
+}
+
+bool CountToBytes(size_t count, size_t elem_size, Elf_Addr* out_bytes) {
+    if (elem_size == 0) {
+        return false;
+    }
+    if (count > std::numeric_limits<size_t>::max() / elem_size) {
+        return false;
+    }
+    const size_t bytes = count * elem_size;
+    if (bytes > static_cast<size_t>(std::numeric_limits<Elf_Addr>::max())) {
+        return false;
+    }
+    *out_bytes = static_cast<Elf_Addr>(bytes);
+    return true;
+}
+}
 
 ElfRebuilder::ElfRebuilder(ObElfReader *elf_reader) {
     elf_reader_ = elf_reader;
@@ -562,13 +641,24 @@ bool ElfRebuilder::ReadSoInfo() {
     si.phdr = elf_reader_->loaded_phdr();
     si.phnum = elf_reader_->phdr_count();
     auto base = si.load_bias;
-    phdr_table_get_load_size(si.phdr, si.phnum, &si.min_load, &si.max_load);
+    if (phdr_table_get_load_size(si.phdr, si.phnum, &si.min_load, &si.max_load) == 0) {
+        FLOGE("Invalid loadable segment range");
+        return false;
+    }
+    if (elf_reader_->pad_size_ > std::numeric_limits<Elf_Addr>::max() - si.max_load) {
+        FLOGE("Invalid load range after padding");
+        return false;
+    }
     si.max_load += elf_reader_->pad_size_;
 
     /* Extract dynamic section */
     elf_reader_->GetDynamicSection(&si.dynamic, &si.dynamic_count, &si.dynamic_flags);
-    if(si.dynamic == nullptr) {
+    if (si.dynamic == nullptr || si.dynamic_count == 0) {
         FLOGE("No valid dynamic phdr data");
+        return false;
+    }
+    if (!PointerInLoad(base, si.dynamic, sizeof(Elf_Dyn), si.min_load, si.max_load)) {
+        FLOGE("Dynamic section pointer out of load range");
         return false;
     }
 
@@ -578,25 +668,50 @@ bool ElfRebuilder::ReadSoInfo() {
     // Extract useful information from dynamic section.
     uint32_t needed_count = 0;
     size_t plt_rel_size_bytes = 0;
+    Elf_Addr strtab_addr = 0;
+    bool has_strtab = false;
+    Elf_Addr symtab_addr = 0;
+    bool has_symtab = false;
+    Elf_Word soname_off = 0;
+    bool has_soname = false;
     for (size_t dyn_idx = 0; dyn_idx < si.dynamic_count; ++dyn_idx) {
         Elf_Dyn* d = si.dynamic + dyn_idx;
         if (d->d_tag == DT_NULL) {
             break;
         }
         switch(d->d_tag){
-            case DT_HASH:
+            case DT_HASH: {
+                Elf_Addr hash_addr = d->d_un.d_ptr;
+                Elf_Addr hash_head_size = static_cast<Elf_Addr>(2 * sizeof(unsigned));
+                if (!RangeInLoad(hash_addr, hash_head_size, si.min_load, si.max_load)) {
+                    FLOGE("Invalid DT_HASH table header");
+                    return false;
+                }
+                auto hash_data = reinterpret_cast<unsigned*>(base + hash_addr);
+                const size_t nbucket = hash_data[0];
+                const size_t nchain = hash_data[1];
+                const size_t total_words = 2 + nbucket + nchain;
+                Elf_Addr hash_table_bytes = 0;
+                if (!CountToBytes(total_words, sizeof(unsigned), &hash_table_bytes) ||
+                    !RangeInLoad(hash_addr, hash_table_bytes, si.min_load, si.max_load)) {
+                    FLOGE("Invalid DT_HASH table size");
+                    return false;
+                }
                 si.hash = d->d_un.d_ptr + (uint8_t*)base;
-                si.nbucket = ((unsigned *) (base + d->d_un.d_ptr))[0];
-                si.nchain = ((unsigned *) (base + d->d_un.d_ptr))[1];
-                si.bucket = (unsigned *) (base + d->d_un.d_ptr + 8);
-                si.chain = (unsigned *) (base + d->d_un.d_ptr + 8 + si.nbucket * 4);
+                si.nbucket = nbucket;
+                si.nchain = nchain;
+                si.bucket = (unsigned *) (base + d->d_un.d_ptr + 2 * sizeof(unsigned));
+                si.chain = si.bucket + si.nbucket;
                 break;
+            }
             case DT_STRTAB:
-                si.strtab = (const char *) (base + d->d_un.d_ptr);
+                strtab_addr = d->d_un.d_ptr;
+                has_strtab = true;
                 FLOGD("string table found at %" ADDRESS_FORMAT "x", d->d_un.d_ptr);
                 break;
             case DT_SYMTAB:
-                si.symtab = (Elf_Sym *) (base + d->d_un.d_ptr);
+                symtab_addr = d->d_un.d_ptr;
+                has_symtab = true;
                 FLOGD("symbol table found at %" ADDRESS_FORMAT "x", d->d_un.d_ptr);
                 break;
             case DT_PLTREL:
@@ -657,7 +772,7 @@ bool ElfRebuilder::ReadSoInfo() {
                 break;
             case DT_PREINIT_ARRAY:
                 si.preinit_array = reinterpret_cast<void**>(base + d->d_un.d_ptr);
-                FLOGD("%s constructors (DT_PREINIT_ARRAY) found at %" ADDRESS_FORMAT "d", si.name, d->d_un.d_ptr);
+                FLOGD("%s constructors (DT_PREINIT_ARRAY) found at %" ADDRESS_FORMAT "x", si.name, d->d_un.d_ptr);
                 break;
             case DT_PREINIT_ARRAYSZ:
                 si.preinit_array_count = ((unsigned)d->d_un.d_val) / sizeof(Elf_Addr);
@@ -707,22 +822,98 @@ bool ElfRebuilder::ReadSoInfo() {
                 si.mips_gotsym = d->d_un.d_val;
                 break;
             case DT_SONAME:
-                si.name = (const char *) (base + d->d_un.d_ptr);
-                FLOGD("soname %s", si.name);
+                soname_off = d->d_un.d_val;
+                has_soname = true;
                 break;
             default:
                 FLOGD("Unused DT entry: type 0x%08" ADDRESS_FORMAT "x arg 0x%08" ADDRESS_FORMAT "x", d->d_tag, d->d_un.d_val);
                 break;
         }
     }
+    if (has_strtab) {
+        if (si.strtabsize == 0 ||
+            si.strtabsize > static_cast<size_t>(std::numeric_limits<Elf_Addr>::max()) ||
+            !RangeInLoad(strtab_addr,
+                         static_cast<Elf_Addr>(si.strtabsize),
+                         si.min_load,
+                         si.max_load)) {
+            FLOGE("Invalid DT_STRTAB range");
+            return false;
+        }
+        si.strtab = reinterpret_cast<const char*>(base + strtab_addr);
+    }
+    if (has_symtab) {
+        if (!RangeInLoad(symtab_addr, static_cast<Elf_Addr>(sizeof(Elf_Sym)), si.min_load, si.max_load)) {
+            FLOGE("Invalid DT_SYMTAB pointer");
+            return false;
+        }
+        si.symtab = reinterpret_cast<Elf_Sym*>(base + symtab_addr);
+    }
+    if (has_soname) {
+        if (StringOffsetValid(si.strtab, si.strtabsize, soname_off)) {
+            si.name = si.strtab + soname_off;
+            FLOGD("soname %s", si.name);
+        } else {
+            FLOGW("Ignore invalid DT_SONAME offset");
+        }
+    }
     if (plt_rel_size_bytes != 0) {
         if (si.plt_type == DT_RELA) {
             si.plt_rel_count = plt_rel_size_bytes / sizeof(Elf_Rela);
-        } else {
+        } else if (si.plt_type == DT_REL) {
             si.plt_rel_count = plt_rel_size_bytes / sizeof(Elf_Rel);
+        } else {
+            FLOGE("Unsupported DT_PLTREL type: 0x%" ADDRESS_FORMAT "x", static_cast<Elf_Addr>(si.plt_type));
+            return false;
         }
         FLOGD("%s plt_rel_count (DT_PLTRELSZ) %zu", si.name, si.plt_rel_count);
     }
+    if (si.rel_count != 0) {
+        if (si.rel == nullptr) {
+            FLOGE("DT_RELSZ found but DT_REL missing");
+            return false;
+        }
+        Elf_Addr rel_bytes = 0;
+        if (!CountToBytes(si.rel_count, sizeof(Elf_Rel), &rel_bytes) ||
+            !PointerInLoad(base, si.rel, rel_bytes, si.min_load, si.max_load)) {
+            FLOGE("Invalid DT_REL range");
+            return false;
+        }
+    }
+    if (si.plt_rela_count != 0) {
+        if (si.plt_rela == nullptr) {
+            FLOGE("DT_RELASZ found but DT_RELA missing");
+            return false;
+        }
+        Elf_Addr rela_bytes = 0;
+        if (!CountToBytes(si.plt_rela_count, sizeof(Elf_Rela), &rela_bytes) ||
+            !PointerInLoad(base, si.plt_rela, rela_bytes, si.min_load, si.max_load)) {
+            FLOGE("Invalid DT_RELA range");
+            return false;
+        }
+    }
+    if (si.plt_rel_count != 0) {
+        if (si.plt_rel == nullptr) {
+            FLOGE("DT_PLTRELSZ found but DT_JMPREL missing");
+            return false;
+        }
+        size_t plt_ent_size = 0;
+        if (si.plt_type == DT_RELA) {
+            plt_ent_size = sizeof(Elf_Rela);
+        } else if (si.plt_type == DT_REL) {
+            plt_ent_size = sizeof(Elf_Rel);
+        } else {
+            FLOGE("Unsupported DT_PLTREL type: 0x%" ADDRESS_FORMAT "x", static_cast<Elf_Addr>(si.plt_type));
+            return false;
+        }
+        Elf_Addr plt_bytes = 0;
+        if (!CountToBytes(si.plt_rel_count, plt_ent_size, &plt_bytes) ||
+            !PointerInLoad(base, si.plt_rel, plt_bytes, si.min_load, si.max_load)) {
+            FLOGE("Invalid DT_JMPREL range");
+            return false;
+        }
+    }
+    (void)needed_count;
     FLOGD("=======================ReadSoInfo End=========================");
     return true;
 }
@@ -730,23 +921,49 @@ bool ElfRebuilder::ReadSoInfo() {
 // Finally, generate rebuild_data
 bool ElfRebuilder::RebuildFin() {
     FLOGD("=======================try to finish file rebuild =========================");
-    auto load_size = si.max_load - si.min_load;
-    auto file_load_end = si.max_load;
-    rebuild_size = file_load_end + shstrtab.length() +
-                   shdrs.size() * sizeof(Elf_Shdr);
+    if (si.max_load < si.min_load) {
+        FLOGE("Invalid load range");
+        return false;
+    }
+    if (si.max_load > static_cast<Elf_Addr>(std::numeric_limits<size_t>::max())) {
+        FLOGE("Load range too large");
+        return false;
+    }
+    const auto load_size = static_cast<size_t>(si.max_load - si.min_load);
+    const auto file_load_end = static_cast<size_t>(si.max_load);
+    const auto shstr_size = shstrtab.length();
+    if (shdrs.size() > std::numeric_limits<size_t>::max() / sizeof(Elf_Shdr)) {
+        FLOGE("Section header table too large");
+        return false;
+    }
+    const auto shdr_bytes = shdrs.size() * sizeof(Elf_Shdr);
+    if (file_load_end > std::numeric_limits<size_t>::max() - shstr_size - shdr_bytes) {
+        FLOGE("Rebuild buffer size overflow");
+        return false;
+    }
+    rebuild_size = file_load_end + shstr_size + shdr_bytes;
+    const auto min_load = static_cast<size_t>(si.min_load);
+    if (min_load > rebuild_size || load_size > rebuild_size - min_load) {
+        FLOGE("Invalid rebuild copy range");
+        return false;
+    }
+    if (rebuild_data != nullptr) {
+        delete []rebuild_data;
+        rebuild_data = nullptr;
+    }
     rebuild_data = new uint8_t[rebuild_size];
     memset(rebuild_data, 0, rebuild_size);
-    memcpy(rebuild_data + si.min_load, (void*)(si.load_bias + si.min_load), load_size);
+    memcpy(rebuild_data + min_load, (void*)(si.load_bias + si.min_load), load_size);
     // pad with shstrtab
     memcpy(rebuild_data + file_load_end, shstrtab.c_str(), shstrtab.length());
     // pad with shdrs
-    auto shdr_off = file_load_end + shstrtab.length();
-    memcpy(rebuild_data + (int)shdr_off, (void*)&shdrs[0],
+    const auto shdr_off = file_load_end + shstrtab.length();
+    memcpy(rebuild_data + shdr_off, (void*)&shdrs[0],
            shdrs.size() * sizeof(Elf_Shdr));
     auto ehdr = *elf_reader_->record_ehdr();
     ehdr.e_type = ET_DYN;
     ehdr.e_shnum = shdrs.size();
-    ehdr.e_shoff = (Elf_Addr)shdr_off;
+    ehdr.e_shoff = static_cast<Elf_Addr>(shdr_off);
     ehdr.e_shstrndx = sSHSTRTAB;
     memcpy(rebuild_data, &ehdr, sizeof(Elf_Ehdr));
 
@@ -782,28 +999,47 @@ void ElfRebuilder::relocate(uint8_t * base, Elf_Rel* rel, Elf_Addr dump_base) {
         case R_ARM_JUMP_SLOT:
         case 0x401: //看到也有该type的重定位信息，其中也是导入表相关内容，所以这里也加上
         case 0x402:{
+            auto apply_import_fallback = [&]() {
+                auto import_base = si.max_load;
+                *prel = import_base + external_pointer;
+                external_pointer += sizeof(*prel);
+            };
             size_t symtab_count_hint = si.nchain;
             if (si.mips_symtabno > symtab_count_hint) {
                 symtab_count_hint = si.mips_symtabno;
             }
             if (symtab_count_hint != 0 && sym >= symtab_count_hint) {
+                apply_import_fallback();
                 break;
             }
-            auto syminfo = si.symtab[sym];
+            if (si.symtab == nullptr) {
+                apply_import_fallback();
+                break;
+            }
+            const auto sym_base = reinterpret_cast<uintptr_t>(si.symtab);
+            if (sym > (std::numeric_limits<uintptr_t>::max() - sym_base) / sizeof(Elf_Sym)) {
+                apply_import_fallback();
+                break;
+            }
+            const Elf_Sym* syminfo_ptr =
+                    reinterpret_cast<const Elf_Sym*>(sym_base + sym * sizeof(Elf_Sym));
+            if (!PointerInLoad(si.load_bias, syminfo_ptr, sizeof(Elf_Sym), si.min_load, si.max_load)) {
+                apply_import_fallback();
+                break;
+            }
+            auto syminfo = *syminfo_ptr;
             if (syminfo.st_value != 0) {
                 *prel = syminfo.st_value;
             } else {
               auto import_base = si.max_load;
               if (mImports.size() == 0){
-                *prel = import_base + external_pointer;
-                external_pointer += sizeof(*prel);
+                apply_import_fallback();
               }else{ //这里如果获取了导入符号内容，并且不为空，则从保存的导入符号数组中获取导入表索引值
                 int nIndex = GetImportSlotBySymIndex(sym);
                 if (nIndex != -1){
                   *prel = import_base + nIndex*sizeof(*prel);
                 } else {
-                  *prel = import_base + external_pointer;
-                  external_pointer += sizeof(*prel);
+                  apply_import_fallback();
                 }
 //                FLOGD("type:0x%x offset:0x%x -- symname:%s nIndex:%d\r\n", type, rel->r_offset, symname, nIndex);
               }
@@ -838,7 +1074,7 @@ int ElfRebuilder::GetImportSlotBySymIndex(size_t symIndex) const {
 void ElfRebuilder::SaveImportsymNames(){
     mImports.clear();
     mImportSymIndexToImportSlot.clear();
-    if (si.symtab == nullptr || si.strtab == nullptr) {
+    if (si.symtab == nullptr || si.strtab == nullptr || si.strtabsize == 0) {
         return;
     }
 
@@ -891,15 +1127,26 @@ void ElfRebuilder::SaveImportsymNames(){
     }
 
     for (size_t nIndex = 0; nIndex < symbol_scan_limit; ++nIndex) {
-        const Elf_Sym& sym = si.symtab[nIndex];
+        const auto sym_base = reinterpret_cast<uintptr_t>(si.symtab);
+        if (nIndex > (std::numeric_limits<uintptr_t>::max() - sym_base) / sizeof(Elf_Sym)) {
+            break;
+        }
+        const Elf_Sym* sym_ptr = reinterpret_cast<const Elf_Sym*>(sym_base + nIndex * sizeof(Elf_Sym));
+        if (!PointerInLoad(si.load_bias, sym_ptr, sizeof(Elf_Sym), si.min_load, si.max_load)) {
+            break;
+        }
+        const Elf_Sym& sym = *sym_ptr;
         if (sym.st_name == 0) {
             continue;
         }
         if (sym.st_shndx != SHN_UNDEF) {
             continue;
         }
-        const char* symname = si.strtab + sym.st_name;
-        if (symname == nullptr || *symname == '\0') {
+        if (!StringOffsetValid(si.strtab, si.strtabsize, sym.st_name)) {
+            continue;
+        }
+        const char* symname = si.strtab + static_cast<size_t>(sym.st_name);
+        if (*symname == '\0') {
             continue;
         }
         mImportSymIndexToImportSlot[nIndex] = mImports.size();
@@ -912,6 +1159,7 @@ bool ElfRebuilder::RebuildRelocs() {
 
     FLOGD("=======================Save_importsym_names=========================");
     SaveImportsymNames();
+    external_pointer = 0;
 
     if(elf_reader_->dump_so_base_ == 0) return true;
     FLOGD("=======================RebuildRelocs=========================");

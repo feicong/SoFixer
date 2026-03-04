@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <fcntl.h>
 #include <errno.h>
 #include <vector>
@@ -216,6 +218,13 @@ size_t phdr_table_get_load_size(const Elf_Phdr* phdr_table,
                                 Elf_Addr* out_min_vaddr,
                                 Elf_Addr* out_max_vaddr)
 {
+    auto safe_add = [](Elf_Addr lhs, Elf_Addr rhs, Elf_Addr* out) -> bool {
+        if (lhs > std::numeric_limits<Elf_Addr>::max() - rhs) {
+            return false;
+        }
+        *out = lhs + rhs;
+        return true;
+    };
 #ifdef __SO64__
     Elf_Addr min_vaddr = 0xFFFFFFFFFFFFFFFFU;
 #else
@@ -236,8 +245,12 @@ size_t phdr_table_get_load_size(const Elf_Phdr* phdr_table,
             min_vaddr = phdr->p_vaddr;
         }
 
-        if (phdr->p_vaddr + phdr->p_memsz > max_vaddr) {
-            max_vaddr = phdr->p_vaddr + phdr->p_memsz;
+        Elf_Addr seg_end = 0;
+        if (!safe_add(phdr->p_vaddr, phdr->p_memsz, &seg_end)) {
+            return 0;
+        }
+        if (seg_end > max_vaddr) {
+            max_vaddr = seg_end;
         }
     }
     if (!found_pt_load) {
@@ -245,7 +258,13 @@ size_t phdr_table_get_load_size(const Elf_Phdr* phdr_table,
     }
 
     min_vaddr = PAGE_START(min_vaddr);
-    max_vaddr = PAGE_END(max_vaddr);
+    if (!safe_add(max_vaddr, PAGE_SIZE - 1, &max_vaddr)) {
+        return 0;
+    }
+    max_vaddr = PAGE_START(max_vaddr);
+    if (max_vaddr < min_vaddr) {
+        return 0;
+    }
 
     if (out_min_vaddr != NULL) {
         *out_min_vaddr = min_vaddr;
@@ -268,12 +287,25 @@ bool ElfReader::ReserveAddressSpace(uint32_t padding_size) {
     }
     pad_size_ = padding_size;
 
-    uint32_t alloc_size = load_size_ + pad_size_;
+    Elf_Addr alloc_size = load_size_;
+    if (alloc_size > std::numeric_limits<Elf_Addr>::max() - pad_size_) {
+        FLOGE("\"%s\" load size overflow", name_);
+        return false;
+    }
+    alloc_size += pad_size_;
+    if (alloc_size > static_cast<Elf_Addr>(std::numeric_limits<size_t>::max())) {
+        FLOGE("\"%s\" load size too large", name_);
+        return false;
+    }
 
     uint8_t* addr = reinterpret_cast<uint8_t*>(min_vaddr);
     // alloc map data, and load in addr
-    uint8_t * start = new uint8_t[alloc_size];
-    memset(start, 0, alloc_size);
+    uint8_t * start = new (std::nothrow) uint8_t[static_cast<size_t>(alloc_size)];
+    if (start == nullptr) {
+        FLOGE("\"%s\" reserve memory failed", name_);
+        return false;
+    }
+    memset(start, 0, static_cast<size_t>(alloc_size));
 
     load_start_ = start;
     // the first loaded phdr data should be loaded in the start of load_start
@@ -571,6 +603,29 @@ phdr_table_get_dynamic_section(const Elf_Phdr* phdr_table,
                                size_t*           dynamic_count,
                                Elf_Word*       dynamic_flags)
 {
+    auto range_in_load = [phdr_table, phdr_count](Elf_Addr start, Elf_Addr size) -> bool {
+        if (size == 0) {
+            return false;
+        }
+        Elf_Addr end = start + size;
+        if (end < start) {
+            return false;
+        }
+        for (int i = 0; i < phdr_count; ++i) {
+            const Elf_Phdr* load = &phdr_table[i];
+            if (load->p_type != PT_LOAD) {
+                continue;
+            }
+            Elf_Addr load_end = load->p_vaddr + load->p_memsz;
+            if (load_end < load->p_vaddr) {
+                continue;
+            }
+            if (start >= load->p_vaddr && end <= load_end) {
+                return true;
+            }
+        }
+        return false;
+    };
     const Elf_Phdr* phdr = phdr_table;
     const Elf_Phdr* phdr_limit = phdr + phdr_count;
 
@@ -579,9 +634,17 @@ phdr_table_get_dynamic_section(const Elf_Phdr* phdr_table,
             continue;
         }
 
+        Elf_Addr dyn_size = phdr->p_memsz;
+        if (phdr->p_filesz != 0 && phdr->p_filesz < dyn_size) {
+            dyn_size = phdr->p_filesz;
+        }
+        if (dyn_size < sizeof(Elf_Dyn) ||
+            !range_in_load(phdr->p_vaddr, dyn_size)) {
+            continue;
+        }
         *dynamic = reinterpret_cast<Elf_Dyn*>(load_bias + phdr->p_vaddr);
         if (dynamic_count) {
-            *dynamic_count = (unsigned)(phdr->p_memsz / sizeof(Elf_Dyn));
+            *dynamic_count = static_cast<size_t>(dyn_size / sizeof(Elf_Dyn));
         }
         if (dynamic_flags) {
             *dynamic_flags = phdr->p_flags;
@@ -671,6 +734,30 @@ bool ElfReader::setSource(const char *source) {
 }
 
 void ElfReader::GetDynamicSection(Elf_Dyn **dynamic, size_t *dynamic_count, Elf_Word *dynamic_flags) {
+    auto range_in_load = [this](Elf_Addr start, Elf_Addr size) -> bool {
+        if (size == 0) {
+            return false;
+        }
+        Elf_Addr end = start + size;
+        if (end < start) {
+            return false;
+        }
+        const Elf_Phdr* load = phdr_table_;
+        const Elf_Phdr* limit = phdr_table_ + phdr_num_;
+        for (; load < limit; ++load) {
+            if (load->p_type != PT_LOAD) {
+                continue;
+            }
+            Elf_Addr load_end = load->p_vaddr + load->p_memsz;
+            if (load_end < load->p_vaddr) {
+                continue;
+            }
+            if (start >= load->p_vaddr && end <= load_end) {
+                return true;
+            }
+        }
+        return false;
+    };
     const Elf_Phdr* phdr = phdr_table_;
     const Elf_Phdr* phdr_limit = phdr + phdr_num_;
 
@@ -679,9 +766,17 @@ void ElfReader::GetDynamicSection(Elf_Dyn **dynamic, size_t *dynamic_count, Elf_
             continue;
         }
 
+        Elf_Addr dyn_size = phdr->p_memsz;
+        if (phdr->p_filesz != 0 && phdr->p_filesz < dyn_size) {
+            dyn_size = phdr->p_filesz;
+        }
+        if (dyn_size < sizeof(Elf_Dyn) ||
+            !range_in_load(phdr->p_vaddr, dyn_size)) {
+            continue;
+        }
         *dynamic = reinterpret_cast<Elf_Dyn*>(load_bias_ + phdr->p_vaddr);
         if (dynamic_count) {
-            *dynamic_count = (unsigned)(phdr->p_memsz / sizeof(Elf_Dyn));
+            *dynamic_count = static_cast<size_t>(dyn_size / sizeof(Elf_Dyn));
         }
         if (dynamic_flags) {
             *dynamic_flags = phdr->p_flags;
