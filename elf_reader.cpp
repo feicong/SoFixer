@@ -1,15 +1,14 @@
 //===------------------------------------------------------------*- C++ -*-===//
 //
-//                     Created by F8LEFT on 2017/6/3.
-//                   Copyright (c) 2017. All rights reserved.
+//                     由F8LEFT创建于2017/6/3。
+//                   版权所有（c）2017。
 //===----------------------------------------------------------------------===//
 //
 //===----------------------------------------------------------------------===//
 // 文件功能：实现ELF读取、段装载、动态段定位与程序头有效性校验。
 
-#include "ElfReader.h"
+#include "elf_reader.h"
 #include "elf.h"
-#include "FDebug.h"
 #include <stdio.h>
 #include <cstdint>
 #include <cstring>
@@ -19,215 +18,131 @@
 #include <errno.h>
 #include <vector>
 
-// 说明：下面保留原始英文技术说明，同时补充中文注释，方便快速理解加载模型。
-/**
-  TECHNICAL NOTE ON ELF LOADING.
-
-  An ELF file's program header table contains one or more PT_LOAD
-  segments, which corresponds to portions of the file that need to
-  be mapped into the process' address space.
-
-  Each loadable segment has the following important properties:
-
-    p_offset  -> segment file offset
-    p_filesz  -> segment file size
-    p_memsz   -> segment memory size (always >= p_filesz)
-    p_vaddr   -> segment's virtual address
-    p_flags   -> segment flags (e.g. readable, writable, executable)
-
-  We will ignore the p_paddr and p_align fields of Elf32_Phdr for now.
-
-  The loadable segments can be seen as a list of [p_vaddr ... p_vaddr+p_memsz)
-  ranges of virtual addresses. A few rules apply:
-
-  - the virtual address ranges should not overlap.
-
-  - if a segment's p_filesz is smaller than its p_memsz, the extra bytes
-    between them should always be initialized to 0.
-
-  - ranges do not necessarily start or end at page boundaries. Two distinct
-    segments can have their start and end on the same page. In this case, the
-    page inherits the mapping flags of the latter segment.
-
-  Finally, the real load addrs of each segment is not p_vaddr. Instead the
-  loader decides where to load the first segment, then will load all others
-  relative to the first one to respect the initial range layout.
-
-  For example, consider the following list:
-
-    [ offset:0,      filesz:0x4000, memsz:0x4000, vaddr:0x30000 ],
-    [ offset:0x4000, filesz:0x2000, memsz:0x8000, vaddr:0x40000 ],
-
-  This corresponds to two segments that cover these virtual address ranges:
-
-       0x30000...0x34000
-       0x40000...0x48000
-
-  If the loader decides to load the first segment at address 0xa0000000
-  then the segments' load address ranges will be:
-
-       0xa0030000...0xa0034000
-       0xa0040000...0xa0048000
-
-  In other words, all segments must be loaded at an address that has the same
-  constant offset from their p_vaddr value. This offset is computed as the
-  difference between the first segment's load address, and its p_vaddr value.
-
-  However, in practice, segments do _not_ start at page boundaries. Since we
-  can only memory-map at page boundaries, this means that the bias is
-  computed as:
-
-       load_bias = phdr0_load_address - PAGE_START(phdr0->p_vaddr)
-
-  (NOTE: The value must be used as a 32-bit unsigned integer, to deal with
-          possible wrap around UINT32_MAX for possible large p_vaddr values).
-
-  And that the phdr0_load_address must start at a page boundary, with
-  the segment's real content starting at:
-
-       phdr0_load_address + PAGE_OFFSET(phdr0->p_vaddr)
-
-  Note that ELF requires the following condition to make the mmap()-ing work:
-
-      PAGE_OFFSET(phdr0->p_vaddr) == PAGE_OFFSET(phdr0->p_offset)
-
-  The load_bias must be added to any p_vaddr value read from the ELF file to
-  determine the corresponding memory address.
-
- **/
+/*
+ * ELF加载技术说明：
+ * 1）程序头中的PT_LOAD描述文件内容映射到进程地址空间的方式。
+ * 2）每个可加载段至少包含：p_offset、p_filesz、p_memsz、p_vaddr、p_flags。
+ * 3）通常要求p_filesz<=p_memsz，超出的内存部分按0填充。
+ * 4）装载时并非直接把段放到p_vaddr，而是根据首段落点计算统一load_bias。
+ * 5）后续虚拟地址转内存地址时统一使用：runtime_addr=load_bias+p_vaddr。
+ * 6）页对齐计算依赖PAGE_START/PAGE_END/PAGE_OFFSET，保证段边界处理一致。
+ */
 
 
+// 将程序头权限位映射到平台保护位。
 #define MAYBE_MAP_FLAG(x,from,to)    (((x) & (from)) ? (to) : 0)
 #define PFLAGS_TO_PROT(x)            (MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC) | \
                                       MAYBE_MAP_FLAG((x), PF_R, PROT_READ) | \
                                       MAYBE_MAP_FLAG((x), PF_W, PROT_WRITE))
-// 构造函数：仅初始化成员，实际加载在Load中完成
-ElfReader::ElfReader()
-        : source_(nullptr), name_(nullptr),
-          phdr_num_(0), phdr_mmap_(NULL), phdr_table_(NULL), phdr_size_(0),
-          load_start_(NULL), load_size_(0), load_bias_(0),
-          loaded_phdr_(NULL) {
-}
+// 构造函数：仅初始化成员，实际加载在Load中完成。
+ElfReader::ElfReader() = default;
 
-// 析构函数：统一释放文件和内存资源
-ElfReader::~ElfReader() {
-    if (phdr_mmap_ != NULL) {
-        delete [](uint8_t*)phdr_mmap_;
-    }
-    if(load_start_ != nullptr) {
-        delete [](uint8_t*)load_start_;
-    }
-    if (source_ != nullptr) {
-        delete source_;
-    }
-}
+// 析构函数：统一释放文件和内存资源。
+ElfReader::~ElfReader() = default;
 
-// 对外主入口：按顺序执行读取、校验、装载和phdr定位
+// 对外主入口：按顺序执行读取、校验、装载和程序头定位。
 bool ElfReader::Load() {
-    // try open
+    // 依次执行读取、校验、装载和程序头定位。
     return ReadElfHeader() &&
            VerifyElfHeader() &&
            ReadProgramHeader() &&
-           // TODO READ dynamic from SECTION header (>= __ANDROID_API_O__)
+           // 后续可补充从节头读取动态段的路径（适配更高版本场景）。
            ReserveAddressSpace() &&
            LoadSegments() &&
            FindPhdr();
 }
 
-// 读取ELF头到header_缓存
+// 读取ELF头到header_缓存。
 bool ElfReader::ReadElfHeader() {
-    auto rc = source_->Read(&header_, sizeof(header_));
+    auto rc = source_->read(&header_, sizeof(header_));
     if (rc != sizeof(header_)) {
-        FLOGE("\"%s\" is too small to be an ELF executable", name_);
+        FLOGE("\"%s\"文件过小，无法识别为ELF", name_);
         return false;
     }
     return true;
 }
 
-// 校验ELF基础合法性，避免后续解析在非法输入上继续执行
+// 校验ELF基础合法性，避免后续解析在非法输入上继续执行。
 bool ElfReader::VerifyElfHeader() {
     if (header_.e_ident[EI_MAG0] != ELFMAG0 ||
         header_.e_ident[EI_MAG1] != ELFMAG1 ||
         header_.e_ident[EI_MAG2] != ELFMAG2 ||
         header_.e_ident[EI_MAG3] != ELFMAG3) {
-        FLOGE("\"%s\" has bad ELF magic", name_);
+        FLOGE("\"%s\"的ELF魔数错误", name_);
         return false;
     }
 #ifndef __SO64__
     if (header_.e_ident[EI_CLASS] != ELFCLASS32) {
-        FLOGE("\"%s\" not 32-bit: %d", name_, header_.e_ident[EI_CLASS]);
+        FLOGE("\"%s\"不是32位ELF：%d", name_, header_.e_ident[EI_CLASS]);
         return false;
     }
 #else
     if (header_.e_ident[EI_CLASS] != ELFCLASS64) {
-        FLOGE("\"%s\" not 64-bit: %d", name_, header_.e_ident[EI_CLASS]);
+        FLOGE("\"%s\"不是64位ELF：%d", name_, header_.e_ident[EI_CLASS]);
         return false;
     }
 #endif
 
     if (header_.e_ident[EI_DATA] != ELFDATA2LSB) {
-        FLOGE("\"%s\" not little-endian: %d", name_, header_.e_ident[EI_DATA]);
+        FLOGE("\"%s\"不是小端字节序：%d", name_, header_.e_ident[EI_DATA]);
         return false;
     }
 
 //    if (header_.e_type != ET_DYN) {
-//        FLOGE("\"%s\" has unexpected e_type: %d", name_, header_.e_type);
+//        FLOGE("\"%s\"的e_type异常：%d", name_, header_.e_type);
 //        return false;
 //    }
 
     if (header_.e_version != EV_CURRENT) {
-        FLOGE("\"%s\" has unexpected e_version: %d", name_, header_.e_version);
+        FLOGE("\"%s\"的e_version不受支持：%d", name_, header_.e_version);
         return false;
     }
 
     return true;
 }
 
-// Loads the program header table from an ELF file into a read-only private
-// anonymous mmap-ed block.
-// 读取程序头表并保存到本地缓冲，后续逻辑都基于此缓冲
+// 读取程序头表并保存到本地缓冲，后续逻辑都基于此缓冲。
 bool ElfReader::ReadProgramHeader() {
     phdr_num_ = header_.e_phnum;
 
-    // Like the kernel, we only accept program header tables that
-    // are smaller than 64KiB.
+    // 与内核一致：程序头表最大限制为64KiB。
     if (phdr_num_ < 1 || phdr_num_ > 65536/sizeof(Elf_Phdr)) {
-        FLOGE("\"%s\" has invalid e_phnum: %zu", name_, phdr_num_);
+        FLOGE("\"%s\"的e_phnum无效：%zu", name_, phdr_num_);
         return false;
     }
 
     phdr_size_ = phdr_num_ * sizeof(Elf_Phdr);
-    void* mmap_result = new uint8_t[phdr_size_];
-    auto rc = source_->Read(mmap_result, phdr_size_, header_.e_phoff);
+    auto mmap_holder = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[phdr_size_]);
+    if (mmap_holder == nullptr) {
+        FLOGE("\"%s\"程序头内存分配失败", name_);
+        return false;
+    }
+    void* mmap_result = mmap_holder.get();
+    auto rc = source_->read(mmap_result, phdr_size_, header_.e_phoff);
     if (rc != phdr_size_) {
-        FLOGE("\"%s\" has no valid phdr data", name_);
-        delete [](uint8_t*)mmap_result;
+        FLOGE("\"%s\"缺少有效程序头数据", name_);
         return false;
     }
 
-    phdr_mmap_ = mmap_result;
+    phdr_mmap_holder_ = std::move(mmap_holder);
+    phdr_mmap_ = phdr_mmap_holder_.get();
     phdr_table_ = reinterpret_cast<Elf_Phdr*>(reinterpret_cast<char*>(mmap_result));
 
     return true;
 }
 
-/* Returns the size of the extent of all the possibly non-contiguous
- * loadable segments in an ELF program header table. This corresponds
- * to the page-aligned size in bytes that needs to be reserved in the
- * process' address space. If there are no loadable segments, 0 is
- * returned.
- *
- * If out_min_vaddr or out_max_vaddr are non-NULL, they will be
- * set to the minimum and maximum addresses of pages to be reserved,
- * or 0 if there is nothing to load.
+/*
+ * 计算所有可加载段覆盖的页对齐区间长度。
+ * 返回值为需要预留的总字节数；若不存在可加载段则返回0。
+ * 若out_min_vaddr/out_max_vaddr非空，会输出页对齐后的最小／最大地址。
  */
 size_t phdr_table_get_load_size(const Elf_Phdr* phdr_table,
                                 size_t phdr_count,
                                 Elf_Addr* out_min_vaddr,
                                 Elf_Addr* out_max_vaddr)
 {
-    // 计算所有PT_LOAD段的页对齐覆盖范围，返回总映射长度
-    // 安全加法：统一处理地址运算溢出
+    // 计算所有PT_LOAD段的页对齐覆盖范围，返回总映射长度。
+    // 安全加法：统一处理地址运算溢出。
     auto safe_add = [](Elf_Addr lhs, Elf_Addr rhs, Elf_Addr* out) -> bool {
         if (lhs > std::numeric_limits<Elf_Addr>::max() - rhs) {
             return false;
@@ -288,54 +203,47 @@ size_t phdr_table_get_load_size(const Elf_Phdr* phdr_table,
     return max_vaddr - min_vaddr;
 }
 
-// Reserve a virtual address range big enough to hold all loadable
-// segments of a program header table. This is done by creating a
-// private anonymous mmap() with PROT_NONE.
-// 预留一块连续缓冲用于承载所有加载段和可选padding
+// 预留一块连续缓冲用于承载所有加载段和可选padding。
 bool ElfReader::ReserveAddressSpace(uint32_t padding_size) {
     Elf_Addr min_vaddr;
     load_size_ = phdr_table_get_load_size(phdr_table_, phdr_num_, &min_vaddr);
     if (load_size_ == 0) {
-        FLOGE("\"%s\" has no loadable segments", name_);
+        FLOGE("\"%s\"不存在可加载段", name_);
         return false;
     }
     pad_size_ = padding_size;
 
     Elf_Addr alloc_size = load_size_;
     if (alloc_size > std::numeric_limits<Elf_Addr>::max() - pad_size_) {
-        FLOGE("\"%s\" load size overflow", name_);
+        FLOGE("\"%s\"加载尺寸溢出", name_);
         return false;
     }
     alloc_size += pad_size_;
     if (alloc_size > static_cast<Elf_Addr>(std::numeric_limits<size_t>::max())) {
-        FLOGE("\"%s\" load size too large", name_);
+        FLOGE("\"%s\"加载尺寸过大", name_);
         return false;
     }
 
     uint8_t* addr = reinterpret_cast<uint8_t*>(min_vaddr);
-    // alloc map data, and load in addr
-    uint8_t * start = new (std::nothrow) uint8_t[static_cast<size_t>(alloc_size)];
-    if (start == nullptr) {
-        FLOGE("\"%s\" reserve memory failed", name_);
+    // 分配加载缓冲并整体清零。
+    auto start_holder = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[static_cast<size_t>(alloc_size)]);
+    if (start_holder == nullptr) {
+        FLOGE("\"%s\"预留内存失败", name_);
         return false;
     }
-    memset(start, 0, static_cast<size_t>(alloc_size));
+    memset(start_holder.get(), 0, static_cast<size_t>(alloc_size));
 
-    load_start_ = start;
-    // the first loaded phdr data should be loaded in the start of load_start
-    // (load_bias_ + phdr.vaddr), so load_bias_ = load_start - phdr.vaddr(min_addr)
-    load_bias_ = reinterpret_cast<uint8_t *>(reinterpret_cast<uintptr_t >(start)
+    load_start_holder_ = std::move(start_holder);
+    load_start_ = load_start_holder_.get();
+    // 将“页对齐后的最小虚拟地址”映射到加载起始地址，据此计算统一偏移基址。
+    load_bias_ = reinterpret_cast<uint8_t *>(reinterpret_cast<uintptr_t >(load_start_)
                                              - reinterpret_cast<uintptr_t >(addr));
     return true;
 }
 
-// Map all loadable segments in process' address space.
-// This assumes you already called phdr_table_reserve_memory to
-// reserve the address space range for the library.
-// TODO: assert assumption.
-// 将每个PT_LOAD段复制到预留缓冲对应偏移处
+// 将每个PT_LOAD段复制到预留缓冲对应偏移处。
 bool ElfReader::LoadSegments() {
-    // TODO fix file dada load error, file data between LOAD seg should be loaded
+    // 后续可完善：当前按段独立拷贝，可再补齐段间文件空洞数据策略。
     for (size_t i = 0; i < phdr_num_; ++i) {
         const Elf_Phdr* phdr = &phdr_table_[i];
 
@@ -343,7 +251,7 @@ bool ElfReader::LoadSegments() {
             continue;
         }
 
-        // Segment addresses in memory.
+        // 计算段在虚拟地址空间中的范围。
         Elf_Addr seg_start = phdr->p_vaddr;
         Elf_Addr seg_end = seg_start + phdr->p_memsz;
         if (seg_end < seg_start) {
@@ -364,8 +272,7 @@ bool ElfReader::LoadSegments() {
             return false;
         }
 
-        // File offsets.
-        // 校验文件区间，避免偏移回绕
+        // 校验文件偏移区间，避免偏移回绕。
         Elf_Addr file_start = phdr->p_offset;
         Elf_Addr file_end = file_start + phdr->p_filesz;
         if (file_end < file_start) {
@@ -378,9 +285,9 @@ bool ElfReader::LoadSegments() {
 
 
         if (file_length != 0) {
-            // memory data loading
+            // 按文件偏移把段内容读入加载缓冲。
             void* load_point = seg_start + reinterpret_cast<uint8_t *>(load_bias_);
-            auto read_size = source_->Read(load_point, file_length, file_start);
+            auto read_size = source_->read(load_point, file_length, file_start);
             if (read_size != file_length) {
                 FLOGE("couldn't map \"%s\" segment %zu: %s", name_, i, strerror(errno));
                 return false;
@@ -388,19 +295,15 @@ bool ElfReader::LoadSegments() {
 
         }
 
-        // if the segment is writable, and does not end on a page boundary,
-        // zero-fill it until the page limit.
+        // 若开启严格装载，可对可写段末页做零填充。
 //        if ((phdr->p_flags & PF_W) != 0 && PAGE_OFFSET(seg_file_end) > 0) {
 //            memset(seg_file_end + reinterpret_cast<uint8_t *>(load_bias_), 0, PAGE_SIZE - PAGE_OFFSET(seg_file_end));
 //        }
 
 //        seg_file_end = PAGE_END(seg_file_end);
 
-        // seg_file_end is now the first page address after the file
-        // content. If seg_end is larger, we need to zero anything
-        // between them. This is done by using a private anonymous
-        // map for all extra pages.
-        // since  data has been clear, just skip this step
+        // 如果段内存长度大于文件长度，额外区域理论上需要补零。
+        // 当前缓冲已预清零，因此这里可直接跳过。
 //        if (seg_page_end > seg_file_end) {
 //            void* load_point = (uint8_t*)load_bias_ + seg_file_end;
 //            memset(load_point, 0, seg_page_end - seg_file_end);
@@ -409,9 +312,9 @@ bool ElfReader::LoadSegments() {
     return true;
 }
 
-/* Used internally. Used to set the protection bits of all loaded segments
- * with optional extra flags (i.e. really PROT_WRITE). Used by
- * phdr_table_protect_segments and phdr_table_unprotect_segments.
+/*
+ * 内部函数：遍历可加载段并设置保护属性。
+ * 目前保留遍历框架，未真正调用mprotect。
  */
 static int
 _phdr_table_set_load_prot(const Elf_Phdr* phdr_table,
@@ -419,7 +322,7 @@ _phdr_table_set_load_prot(const Elf_Phdr* phdr_table,
                           uint8_t *load_bias,
                           int               extra_prot_flags)
 {
-    // 当前项目不实际调用mprotect，此处保留接口和段遍历逻辑
+    // 当前项目不实际调用mprotect，此处保留接口和段遍历逻辑。
     const Elf_Phdr* phdr = phdr_table;
     const Elf_Phdr* phdr_limit = phdr + phdr_count;
 
@@ -442,65 +345,45 @@ _phdr_table_set_load_prot(const Elf_Phdr* phdr_table,
     return 0;
 }
 
-/* Restore the original protection modes for all loadable segments.
- * You should only call this after phdr_table_unprotect_segments and
- * applying all relocations.
- *
- * Input:
- *   phdr_table  -> program header table
- *   phdr_count  -> number of entries in tables
- *   load_bias   -> load bias
- * Return:
- *   0 on error, -1 on failure (error code in errno).
+/*
+ * 对外接口：恢复可加载段原有保护属性。
+ * 当前实现仅保留接口与遍历逻辑。
  */
 int
 phdr_table_protect_segments(const Elf_Phdr* phdr_table,
                             int               phdr_count,
                             uint8_t *load_bias)
 {
-    // 对外接口：恢复段保护（当前为保留实现）
-    // 当前实现等价于遍历检查，便于后续扩展真实保护逻辑
+    // 对外接口：恢复段保护（当前为保留实现）。
+    // 当前实现等价于遍历检查，便于后续扩展真实保护逻辑。
     return _phdr_table_set_load_prot(phdr_table, phdr_count,
                                      load_bias, 0);
 }
 
-/* Change the protection of all loaded segments in memory to writable.
- * This is useful before performing relocations. Once completed, you
- * will have to call phdr_table_protect_segments to restore the original
- * protection flags on all segments.
- *
- * Note that some writable segments can also have their content turned
- * to read-only by calling phdr_table_protect_gnu_relro. This is no
- * performed here.
- *
- * Input:
- *   phdr_table  -> program header table
- *   phdr_count  -> number of entries in tables
- *   load_bias   -> load bias
- * Return:
- *   0 on error, -1 on failure (error code in errno).
+/*
+ * 对外接口：临时放宽段保护属性，便于后续做重定位修补。
+ * 当前实现仅保留框架，未实际调用mprotect。
  */
 int
 phdr_table_unprotect_segments(const Elf_Phdr* phdr_table,
                               int               phdr_count,
                               uint8_t *load_bias)
 {
-    // 对外接口：放宽段保护（当前为保留实现）
-    // 预留可写保护接口，当前未启用真实mprotect
+    // 对外接口：放宽段保护（当前为保留实现）。
+    // 预留可写保护接口，当前未启用真实mprotect。
     return _phdr_table_set_load_prot(phdr_table, phdr_count,
                                      load_bias, /*PROT_WRITE*/0);
 }
 
-/* Used internally by phdr_table_protect_gnu_relro and
- * phdr_table_unprotect_gnu_relro.
- */
+/* 内部函数：处理GNU RELRO段的保护逻辑。 */
 static int
 _phdr_table_set_gnu_relro_prot(const Elf_Phdr* phdr_table,
                                int               phdr_count,
                                uint8_t *load_bias,
                                int               prot_flags)
 {
-    // 当前只保留遍历框架，便于后续补齐RELRO真实保护
+    // 当前只保留遍历框架，便于后续补齐RELRO真实保护。
+    // 注意：PT_GNU_RELRO筛选与mprotect调用均处于关闭状态。
     const Elf_Phdr* phdr = phdr_table;
     const Elf_Phdr* phdr_limit = phdr + phdr_count;
 
@@ -508,22 +391,9 @@ _phdr_table_set_gnu_relro_prot(const Elf_Phdr* phdr_table,
 //        if (phdr->p_type != PT_GNU_RELRO)
 //            continue;
 
-        /* Tricky: what happens when the relro segment does not start
-         * or end at page boundaries?. We're going to be over-protective
-         * here and put every page touched by the segment as read-only.
-         *
-         * This seems to match Ian Lance Taylor's description of the
-         * feature at http://www.airs.com/blog/archives/189.
-         *
-         * Extract:
-         *    Note that the current dynamic linker code will only work
-         *    correctly if the PT_GNU_RELRO segment starts on a page
-         *    boundary. This is because the dynamic linker rounds the
-         *    p_vaddr field down to the previous page boundary. If
-         *    there is anything on the page which should not be read-only,
-         *    the program is likely to fail at runtime. So in effect the
-         *    linker must only emit a PT_GNU_RELRO segment if it ensures
-         *    that it starts on a page boundary.
+        /*
+         * RELRO段若未严格按页边界对齐，保护粒度会扩展到整页。
+         * 因此实际处理时通常以“段覆盖到的整页”作为最小保护单位。
          */
         auto seg_page_start = PAGE_START(phdr->p_vaddr) + load_bias;
         auto seg_page_end   = PAGE_END(phdr->p_vaddr + phdr->p_memsz) + load_bias;
@@ -539,29 +409,17 @@ _phdr_table_set_gnu_relro_prot(const Elf_Phdr* phdr_table,
     return 0;
 }
 
-/* Apply GNU relro protection if specified by the program header. This will
- * turn some of the pages of a writable PT_LOAD segment to read-only, as
- * specified by one or more PT_GNU_RELRO segments. This must be always
- * performed after relocations.
- *
- * The areas typically covered are .got and .data.rel.ro, these are
- * read-only from the program's POV, but contain absolute addresses
- * that need to be relocated before use.
- *
- * Input:
- *   phdr_table  -> program header table
- *   phdr_count  -> number of entries in tables
- *   load_bias   -> load bias
- * Return:
- *   0 on error, -1 on failure (error code in errno).
+/*
+ * 对外接口：应用GNU RELRO保护。
+ * 典型场景是把.got等重定位完成后的区域改为只读。
  */
 int
 phdr_table_protect_gnu_relro(const Elf_Phdr* phdr_table,
                              int               phdr_count,
                              uint8_t *load_bias)
 {
-    // 对外接口：处理GNU RELRO保护（当前为保留实现）
-    // 对外RELRO保护入口
+    // 对外接口：处理GNU RELRO保护（当前为保留实现）。
+    // 对外RELRO保护入口。
     return _phdr_table_set_gnu_relro_prot(phdr_table,
                                           phdr_count,
                                           load_bias,
@@ -570,21 +428,12 @@ phdr_table_protect_gnu_relro(const Elf_Phdr* phdr_table,
 
 
 #  ifndef PT_ARM_EXIDX
-#    define PT_ARM_EXIDX    0x70000001      /* .ARM.exidx segment */
+#    define PT_ARM_EXIDX    0x70000001      /* .ARM.exidx段 */
 #  endif
 
-/* Return the address and size of the .ARM.exidx section in memory,
- * if present.
- *
- * Input:
- *   phdr_table  -> program header table
- *   phdr_count  -> number of entries in tables
- *   load_bias   -> load bias
- * Output:
- *   arm_exidx       -> address of table in memory (NULL on failure).
- *   arm_exidx_count -> number of items in table (0 on failure).
- * Return:
- *   0 on error, -1 on failure (_no_ error code in errno)
+/*
+ * 返回.ARM.exidx在内存中的地址和条目数量。
+ * 找到则返回0，未找到返回-1。
  */
 int
 phdr_table_get_arm_exidx(const Elf_Phdr* phdr_table,
@@ -593,8 +442,8 @@ phdr_table_get_arm_exidx(const Elf_Phdr* phdr_table,
                          Elf_Addr**      arm_exidx,
                          unsigned*         arm_exidx_count)
 {
-    // 对外接口：返回ARM异常回溯段地址及条目数量
-    // 从程序头中查找ARM异常回溯表
+    // 对外接口：返回ARM异常回溯段地址及条目数量。
+    // 从程序头中查找ARM异常回溯表。
     const Elf_Phdr* phdr = phdr_table;
     const Elf_Phdr* phdr_limit = phdr + phdr_count;
 
@@ -611,19 +460,9 @@ phdr_table_get_arm_exidx(const Elf_Phdr* phdr_table,
     return -1;
 }
 
-/* Return the address and size of the ELF file's .dynamic section in memory,
- * or NULL if missing.
- *
- * Input:
- *   phdr_table  -> program header table
- *   phdr_count  -> number of entries in tables
- *   load_bias   -> load bias
- * Output:
- *   dynamic       -> address of table in memory (NULL on failure).
- *   dynamic_count -> number of items in table (0 on failure).
- *   dynamic_flags -> protection flags for section (unset on failure)
- * Return:
- *   void
+/*
+ * 从程序头中提取.dynamic段地址、项数和权限标记。
+ * 若未找到有效动态段，则dynamic输出为NULL。
  */
 void
 phdr_table_get_dynamic_section(const Elf_Phdr* phdr_table,
@@ -633,8 +472,8 @@ phdr_table_get_dynamic_section(const Elf_Phdr* phdr_table,
                                size_t*           dynamic_count,
                                Elf_Word*       dynamic_flags)
 {
-    // 对外接口：从程序头中提取动态段信息
-    // 动态段必须完全落在某个PT_LOAD范围内
+    // 对外接口：从程序头中提取动态段信息。
+    // 动态段必须完全落在某个PT_LOAD范围内。
     auto range_in_load = [phdr_table, phdr_count](Elf_Addr start, Elf_Addr size) -> bool {
         if (size == 0) {
             return false;
@@ -689,27 +528,22 @@ phdr_table_get_dynamic_section(const Elf_Phdr* phdr_table,
     }
 }
 
-// Returns the address of the program header table as it appears in the loaded
-// segments in memory. This is in contrast with 'phdr_table_' which
-// is temporary and will be released before the library is relocated.
-// 在已加载镜像中定位程序头表入口，优先PT_PHDR，兜底首个PT_LOAD+e_phoff。
+// 在已加载镜像中定位程序头表入口，优先PT_PHDR，兜底首个PT_LOAD＋e_phoff。
 bool ElfReader::FindPhdr() {
     const Elf_Phdr* phdr_limit = phdr_table_ + phdr_num_;
 
-    // If there is a PT_PHDR, use it directly.
+    // 优先使用PT_PHDR直接定位。
     for (const Elf_Phdr* phdr = phdr_table_; phdr < phdr_limit; ++phdr) {
         if (phdr->p_type == PT_PHDR) {
             return CheckPhdr((uint8_t*)load_bias_ + phdr->p_vaddr);
         }
     }
 
-    // Otherwise, check the first loadable segment. If its file offset
-    // is 0, it starts with the ELF header, and we can trivially find the
-    // loaded program header from it.
+    // 若无PT_PHDR，则尝试从首个偏移为0的PT_LOAD反推出程序头地址。
     for (const Elf_Phdr* phdr = phdr_table_; phdr < phdr_limit; ++phdr) {
         if (phdr->p_type == PT_LOAD) {
             if (phdr->p_offset == 0) {
-                // 常见场景：首个可加载段偏移为0，可直接通过e_phoff定位程序头
+                // 常见场景：首个可加载段偏移为0，可直接通过e_phoff定位程序头。
                 uint8_t *elf_addr = (uint8_t*)load_bias_ + phdr->p_vaddr;
                 const Elf_Ehdr* ehdr = (const Elf_Ehdr*)(void*)elf_addr;
                 Elf_Addr  offset = ehdr->e_phoff;
@@ -719,18 +553,15 @@ bool ElfReader::FindPhdr() {
         }
     }
 
-    FLOGE("can't find loaded phdr for \"%s\"", name_);
+    FLOGE("无法在\"%s\"中定位已加载程序头", name_);
     return false;
 }
 
-// Ensures that our program header is actually within a loadable
-// segment. This should help catch badly-formed ELF files that
-// would cause the linker to crash later when trying to access it.
 // 校验程序头表指针范围是否落在可加载段内，避免后续越界访问。
 bool ElfReader::CheckPhdr(uint8_t * loaded) {
     const Elf_Phdr* phdr_limit = phdr_table_ + phdr_num_;
     auto loaded_end = loaded + (phdr_num_ * sizeof(Elf_Phdr));
-    // 保证loaded指针覆盖区间完全落在某个可加载段内
+    // 保证loaded指针覆盖区间完全落在某个可加载段内。
     for (Elf_Phdr* phdr = phdr_table_; phdr < phdr_limit; ++phdr) {
         if (phdr->p_type != PT_LOAD) {
             continue;
@@ -746,33 +577,44 @@ bool ElfReader::CheckPhdr(uint8_t * loaded) {
             return true;
         }
     }
-    FLOGE("\"%s\" loaded phdr %p not in loadable segment", name_, loaded);
+    FLOGE("\"%s\"的已加载程序头%p不在可加载段内", name_, loaded);
     return false;
 }
 
+// 将临时程序头表同步回已加载镜像中的程序头区域。
 void ElfReader::ApplyPhdrTable() {
-    // 把修正后的程序头表写回已加载镜像，保证后续重建读取到的是修正值
+    // 把修正后的程序头表写回已加载镜像，保证后续重建读取到的是修正值。
     const Elf_Phdr* phdr_limit = phdr_table_ + phdr_num_;
     memcpy((void*)loaded_phdr_, (void*)phdr_table_, (uintptr_t)phdr_limit - (uintptr_t)phdr_table_ );
     return ;
 }
 
 
+// 绑定输入文件路径并初始化底层文件读取器。
 bool ElfReader::setSource(const char *source) {
-    // 打开输入文件并缓存大小
-    name_ = source;
-    auto fr = new FileReader(source);
-    if (!fr->Open()) {
-        delete fr;
+    return set_source(source == nullptr ? std::string_view() : std::string_view(source));
+}
+
+bool ElfReader::set_source(std::string_view source) {
+    // 打开输入文件并缓存大小。
+    if (source.empty()) {
         return false;
     }
-    file_size = fr->FileSize();
-    source_ = fr;
+    name_storage_ = source;
+    name_ = name_storage_.c_str();
+    auto fr = std::make_unique<FileReader>(source);
+    if (!fr->open()) {
+        return false;
+    }
+    file_size = static_cast<size_t>(fr->file_size());
+    source_holder_ = std::move(fr);
+    source_ = source_holder_.get();
     return true;
 }
 
+// 读取当前实例中的动态段信息，供重建阶段提取DT_*元数据。
 void ElfReader::GetDynamicSection(Elf_Dyn **dynamic, size_t *dynamic_count, Elf_Word *dynamic_flags) {
-    // 与全局版本同逻辑，读取当前实例中的动态段
+    // 与全局版本同逻辑，读取当前实例中的动态段。
     auto range_in_load = [this](Elf_Addr start, Elf_Addr size) -> bool {
         if (size == 0) {
             return false;

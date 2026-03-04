@@ -3,3 +3,10 @@ cmake-*
 res
 test
 .DS_Store
+build/
+build-review64/
+build-android-arm64/
+dist/
+release-assets/
+release-files/
+*.so

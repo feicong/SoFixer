@@ -1,3 +1,0 @@
-/Volumes/macOS/SoFixer-up/build-review64/CMakeFiles/SoFixer64.dir
-/Volumes/macOS/SoFixer-up/build-review64/CMakeFiles/edit_cache.dir
-/Volumes/macOS/SoFixer-up/build-review64/CMakeFiles/rebuild_cache.dir
