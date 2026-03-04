@@ -79,7 +79,7 @@ jobs:
       id: setup-ndk
       uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r27c
+        ndk-version: r29
 
     - name: Configure CMake(Android arm64-v8a)
       run: >

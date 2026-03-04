@@ -46,15 +46,24 @@ using Elf_Word = Elf64_Word;
 #ifndef PAGE_SIZE
 // 默认按4KB页处理地址对齐。
 #define PAGE_SIZE 0x1000
+#endif
 
+#ifndef PAGE_MASK
 // 页掩码
 #define PAGE_MASK (~(PAGE_SIZE - 1))
+#endif
+
+#ifndef PAGE_START
 // 取地址x所在页的起始地址。
 #define PAGE_START(x) ((x) & PAGE_MASK)
+#endif
 
+#ifndef PAGE_OFFSET
 // 取地址x在页内的偏移。
 #define PAGE_OFFSET(x) ((x) & ~PAGE_MASK)
+#endif
 
+#ifndef PAGE_END
 // 取包含地址x的末尾页边界（向上按页对齐）。
 #define PAGE_END(x) PAGE_START((x) + (PAGE_SIZE - 1))
 #endif
