@@ -10,6 +10,9 @@ on:
 env:
   BUILD_TYPE: Release
 
+permissions:
+  contents: write
+
 jobs:
   build_native:
     strategy:
@@ -70,3 +73,31 @@ jobs:
         name: SoFixer-Android-arm64
         path: ${{ github.workspace }}/build-android-arm64/SoFixer64
         if-no-files-found: error
+
+  publish_latest:
+    if: github.event_name != 'pull_request'
+    needs: [build_native, build_android_arm64]
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: release-assets
+
+    - name: Collect release files
+      run: |
+        mkdir -p release-files
+        find release-assets -type f -exec cp {} release-files/ \;
+        ls -la release-files
+
+    - name: Create or update latest release and overwrite assets
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if gh release view latest >/dev/null 2>&1; then
+          echo "release latest exists, upload with overwrite"
+        else
+          gh release create latest --title "latest" --notes "latest build artifacts"
+        fi
+        gh release upload latest release-files/* --clobber
