@@ -1,9 +1,10 @@
 name: auto build and release
 
-on: 
+on:
   push:
     tags:
       - v*     # Push events for all vx tags#
+  workflow_dispatch:
 
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
@@ -13,7 +14,7 @@ jobs:
   create_release:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Create Release
       id: create_release
       uses: actions/create-release@v1
@@ -30,61 +31,82 @@ jobs:
   publish:
     needs: [create_release]
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        so_64: [OFF, ON]
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
-    - name: build32 environment create
-      run: cmake -E make_directory ${{github.workspace}}/build32
+    - name: Configure CMake
+      run: cmake -S ${{ github.workspace }} -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DSO_64=${{ matrix.so_64 }}
 
-    - name: build32 Configure CMake
+    - name: Build
+      run: cmake --build ${{ github.workspace }}/build --config $BUILD_TYPE
+
+    - name: Prepare artifact metadata
+      id: artifact
       shell: bash
-      working-directory: ${{github.workspace}}/build32
-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DSO_64=OFF -G "CodeBlocks - Unix Makefiles"
+      run: |
+        if [ "${{ matrix.so_64 }}" = "ON" ]; then
+          BIN_NAME="SoFixer64"
+          ARCH_TAG="64"
+        else
+          BIN_NAME="SoFixer32"
+          ARCH_TAG="32"
+        fi
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          EXT=".exe"
+        else
+          EXT=""
+        fi
+        echo "asset_path=${{ github.workspace }}/build/${BIN_NAME}${EXT}" >> "$GITHUB_OUTPUT"
+        echo "asset_name=SoFixer-${{ runner.os }}-${ARCH_TAG}${EXT}" >> "$GITHUB_OUTPUT"
 
-    - name: build32 build
-      working-directory: ${{github.workspace}}/build32
-      shell: bash
-      run: cmake --build . --config $BUILD_TYPE
-
-    - name: build64 environment create
-      run: cmake -E make_directory ${{github.workspace}}/build64
-
-    - name: build64 Configure CMake
-      shell: bash
-      working-directory: ${{github.workspace}}/build64
-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DSO_64=ON -G "CodeBlocks - Unix Makefiles"
-
-    - name: build64 build
-      working-directory: ${{github.workspace}}/build64
-      shell: bash
-      run: cmake --build . --config $BUILD_TYPE
-
-
-    - name: Name Format
-      id: release_name_format
-      if: ${{ runner.os == 'Windows' }}
-      run: echo "::set-output name=format::.exe"
-
-    - name: Upload build 32
+    - name: Upload build artifact
       uses: actions/upload-release-asset@v1.0.2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: '${{ needs.create_release.outputs.UPLOAD_URL }}'
-        asset_path: '${{ github.workspace }}/build32/SoFixer32${{ steps.release_name_format.outputs.format }}'
-        asset_name: 'SoFixer-${{ runner.os }}-32${{ steps.release_name_format.outputs.format }}'
+        asset_path: '${{ steps.artifact.outputs.asset_path }}'
+        asset_name: '${{ steps.artifact.outputs.asset_name }}'
         asset_content_type: application/octet-stream
 
-    - name: Upload build 64
+  publish_android_arm64:
+    needs: [create_release]
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r27c
+
+    - name: Configure CMake(Android arm64-v8a)
+      run: >
+        cmake -S ${{ github.workspace }}
+        -B ${{ github.workspace }}/build-android-arm64
+        -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+        -DSO_64=ON
+        -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake
+        -DANDROID_ABI=arm64-v8a
+        -DANDROID_PLATFORM=android-21
+
+    - name: Build(Android arm64-v8a)
+      run: cmake --build ${{ github.workspace }}/build-android-arm64 --config $BUILD_TYPE
+
+    - name: Upload Android arm64 build
       uses: actions/upload-release-asset@v1.0.2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: '${{ needs.create_release.outputs.UPLOAD_URL }}'
-        asset_path: '${{ github.workspace }}/build64/SoFixer64${{ steps.release_name_format.outputs.format }}'
-        asset_name: 'SoFixer-${{ runner.os }}-64${{ steps.release_name_format.outputs.format }}'
+        asset_path: '${{ github.workspace }}/build-android-arm64/SoFixer64'
+        asset_name: 'SoFixer-Android-arm64'
         asset_content_type: application/octet-stream

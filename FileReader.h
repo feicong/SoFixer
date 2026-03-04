@@ -50,12 +50,7 @@ public:
         if (offset >= 0) {
             fseek(fp, offset, SEEK_SET);
         }
-        auto rc = TEMP_FAILURE_RETRY(fread(addr, 1, len, fp));
-
-        if (rc < 0) {
-            FLOGE("can't read file \"%s\": %s", source, strerror(errno));
-            return rc;
-        }
+        auto rc = fread(addr, 1, len, fp);
         if (rc != len) {
             FLOGE("\"%s\" has no enough data at %x:%zx, not a valid file or you need to dump more data", source, offset, len);
             return rc;

@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
-#include <unistd.h>
 #include <errno.h>
 #include <vector>
 
@@ -675,4 +674,3 @@ void ElfReader::GetDynamicSection(Elf_Dyn **dynamic, size_t *dynamic_count, Elf_
         *dynamic_count = 0;
     }
 }
-

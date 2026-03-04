@@ -2,9 +2,9 @@
 #include "ObElfReader.h"
 #include "ElfRebuilder.h"
 #include "FDebug.h"
-#include <getopt.h>
 #include <stdio.h>
 #include <cstring>
+#include <cstdlib>
 
 #ifdef __SO64__
 #define TARGET_NAME "SoFixer64"
@@ -13,67 +13,99 @@
 #endif
 
 
-const char* short_options = "hdm:s:o:b:";
-const struct option long_options[] = {
-        {"help", 0, NULL, 'h'},
-        {"debug", 0, NULL, 'd'},
-        {"memso", 1, NULL, 'm'},
-        {"source", 1, NULL, 's'},
-        {"baseso", 1, NULL, 'b'},
-        {"output", 1, NULL, 'o'},
-        {nullptr, 0, nullptr, 0}
-};
 void useage();
 
+static bool is16Bit(const char* value) {
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    auto len = strlen(value);
+    if (len > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+        return true;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if ((value[i] >= 'a' && value[i] <= 'f') ||
+            (value[i] >= 'A' && value[i] <= 'F')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool matchLongOption(const std::string& arg, const char* name, std::string& value) {
+    std::string prefix(name);
+    prefix += "=";
+    if (arg.rfind(prefix, 0) == 0) {
+        value = arg.substr(prefix.size());
+        return true;
+    }
+    return false;
+}
 
 bool main_loop(int argc, char* argv[]) {
-    int c;
-
     ObElfReader elf_reader;
 
     std::string source, output, baseso;
-    while((c = getopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
-        switch (c) {
-            case 'd':
-                FLOGI("Use debug mode");
-                break;
-            case 's':
-                source = optarg;
-                break;
-            case 'o':
-                output = optarg;
-                break;
-            case 'b':
-                baseso = optarg;
-                break;
-            case 'm': {
-                auto is16Bit = [](const char* value) {
-                    if (value == nullptr || *value == '\0') {
-                        return false;
-                    }
-                    auto len = strlen(value);
-                    if (len > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
-                        return true;
-                    }
-                    for (size_t i = 0; i < len; i++) {
-                        if ((value[i] >= 'a' && value[i] <= 'f') ||
-                            (value[i] >= 'A' && value[i] <= 'F')) {
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-#ifndef __SO64__
-                auto base = strtoul(optarg, 0, is16Bit(optarg) ? 16: 10);
-#else
-                auto base = strtoull(optarg, 0, is16Bit(optarg) ? 16: 10);
-#endif
-                elf_reader.setDumpSoBaseAddr(base);
-            }
-                break;
-            default:
-                return false;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "-d" || arg == "--debug") {
+            FLOGI("Use debug mode");
+            continue;
         }
+        if (arg == "-h" || arg == "--help") {
+            return false;
+        }
+        if (arg == "-s" || arg == "--source") {
+            if (i + 1 >= argc) return false;
+            source = argv[++i];
+            continue;
+        }
+        if (arg == "-o" || arg == "--output") {
+            if (i + 1 >= argc) return false;
+            output = argv[++i];
+            continue;
+        }
+        if (arg == "-b" || arg == "--baseso") {
+            if (i + 1 >= argc) return false;
+            baseso = argv[++i];
+            continue;
+        }
+        if (arg == "-m" || arg == "--memso") {
+            if (i + 1 >= argc) return false;
+            const char* memArg = argv[++i];
+#ifndef __SO64__
+            auto base = strtoul(memArg, nullptr, is16Bit(memArg) ? 16 : 10);
+#else
+            auto base = strtoull(memArg, nullptr, is16Bit(memArg) ? 16 : 10);
+#endif
+            elf_reader.setDumpSoBaseAddr(base);
+            continue;
+        }
+
+        std::string value;
+        if (matchLongOption(arg, "--source", value)) {
+            source = value;
+            continue;
+        }
+        if (matchLongOption(arg, "--output", value)) {
+            output = value;
+            continue;
+        }
+        if (matchLongOption(arg, "--baseso", value)) {
+            baseso = value;
+            continue;
+        }
+        if (matchLongOption(arg, "--memso", value)) {
+#ifndef __SO64__
+            auto base = strtoul(value.c_str(), nullptr, is16Bit(value.c_str()) ? 16 : 10);
+#else
+            auto base = strtoull(value.c_str(), nullptr, is16Bit(value.c_str()) ? 16 : 10);
+#endif
+            elf_reader.setDumpSoBaseAddr(base);
+            continue;
+        }
+
+        return false;
     }
 
     FLOGI("start to rebuild elf file");
