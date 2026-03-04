@@ -2,3 +2,4 @@ cmake-*
 .idea
 res
 test
+.DS_Store
