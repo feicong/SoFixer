@@ -35,11 +35,39 @@ jobs:
       working-directory: ${{ github.workspace }}/build
       run: ctest --build-config ${{ env.BUILD_TYPE }} --output-on-failure
 
+    - name: Prepare native binary
+      shell: pwsh
+      run: |
+        $arch = "${{ runner.arch }}".ToLowerInvariant()
+        New-Item -ItemType Directory -Path "$env:GITHUB_WORKSPACE/dist" -Force | Out-Null
+        if ("${{ matrix.os }}" -eq "windows-latest") {
+          $src = "$env:GITHUB_WORKSPACE/build/Release/SoFixer64.exe"
+          if (!(Test-Path $src)) {
+            $src = "$env:GITHUB_WORKSPACE/build/SoFixer64.exe"
+          }
+          if (!(Test-Path $src)) {
+            throw "windows binary not found"
+          }
+          Copy-Item $src "$env:GITHUB_WORKSPACE/dist/SoFixer-windows-$arch.exe"
+        } elseif ("${{ matrix.os }}" -eq "macos-latest") {
+          $src = "$env:GITHUB_WORKSPACE/build/SoFixer64"
+          if (!(Test-Path $src)) {
+            throw "macos binary not found"
+          }
+          Copy-Item $src "$env:GITHUB_WORKSPACE/dist/SoFixer-macos-$arch"
+        } else {
+          $src = "$env:GITHUB_WORKSPACE/build/SoFixer64"
+          if (!(Test-Path $src)) {
+            throw "ubuntu binary not found"
+          }
+          Copy-Item $src "$env:GITHUB_WORKSPACE/dist/SoFixer-ubuntu-$arch"
+        }
+
     - name: Upload native artifact
       uses: actions/upload-artifact@v6
       with:
-        name: SoFixer-${{ matrix.os }}-64
-        path: ${{ github.workspace }}/build/SoFixer64*
+        name: SoFixer-${{ matrix.os }}-${{ runner.arch }}
+        path: ${{ github.workspace }}/dist/SoFixer-*
         if-no-files-found: error
 
   build_android_arm64:
@@ -52,7 +80,7 @@ jobs:
       id: setup-ndk
       uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r27c
+        ndk-version: r29
 
     - name: Configure CMake(Android arm64-v8a)
       run: >
@@ -67,11 +95,16 @@ jobs:
     - name: Build(Android arm64-v8a)
       run: cmake --build ${{ github.workspace }}/build-android-arm64 --config ${{ env.BUILD_TYPE }}
 
+    - name: Prepare Android binary
+      run: |
+        mkdir -p ${{ github.workspace }}/dist
+        cp ${{ github.workspace }}/build-android-arm64/SoFixer64 ${{ github.workspace }}/dist/SoFixer-android-arm64
+
     - name: Upload Android artifact
       uses: actions/upload-artifact@v6
       with:
         name: SoFixer-Android-arm64
-        path: ${{ github.workspace }}/build-android-arm64/SoFixer64
+        path: ${{ github.workspace }}/dist/SoFixer-android-arm64
         if-no-files-found: error
 
   publish_latest:
@@ -80,8 +113,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - uses: actions/checkout@v6
+
     - name: Download all build artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v6
       with:
         path: release-assets
 
@@ -100,4 +135,14 @@ jobs:
         else
           gh release create latest --title "latest" --notes "latest build artifacts"
         fi
+
+        assets=$(gh release view latest --json assets --jq '.assets[].name')
+        if [ -n "$assets" ]; then
+          while IFS= read -r asset; do
+            if [ -n "$asset" ]; then
+              gh release delete-asset latest "$asset" -y
+            fi
+          done <<< "$assets"
+        fi
+
         gh release upload latest release-files/* --clobber

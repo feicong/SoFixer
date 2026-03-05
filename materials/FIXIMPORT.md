@@ -1,6 +1,6 @@
 ## 修复简记
 
-修复的过程主要针对 ElfRebuilder.cpp 中的 relocate 函数。
+修复的过程主要针对 elf_rebuilder.cpp 中的 relocate 函数。
 
 ```C++
     switch (type) {

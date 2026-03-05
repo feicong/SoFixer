@@ -1,0 +1,121 @@
+@startuml
+skinparam BackgroundColor #ffffff
+skinparam DefaultFontName "PingFang SC"
+skinparam ActivityFontName "PingFang SC"
+skinparam ArrowColor #333333
+skinparam ActivityBorderColor #333333
+skinparam ActivityBackgroundColor #f7f7f7
+skinparam NoteBackgroundColor #fff8dc
+skinparam NoteBorderColor #666666
+
+start
+
+partition "1）Elf_Ehdr字段修正" {
+  :保持原值\ne_ident/e_machine/e_entry\ne_phoff/e_phentsize/e_phnum;
+  :回写\ne_type=ET_DYN\ne_shoff=file_load_end+shstr_size\ne_shnum=shdrs.size()\ne_shstrndx=sSHSTRTAB;
+  note right
+  计算依据
+  1）节头表重建后位置变化
+  2）必须回写新的节头偏移和索引
+  end note
+}
+
+partition "2）Elf_Phdr字段修正" {
+  if (dump_so_base_!=0) then (是)
+    :FixDumpSoPhdr;
+    :PT_LOAD按vaddr排序;
+    :非末段\np_memsz=next_vaddr-cur_vaddr;
+    :末段\np_memsz=file_size-cur_vaddr;
+    :统一改写\np_filesz=p_memsz\np_paddr=p_vaddr\np_offset=p_vaddr;
+  else (否)
+    :跳过转储预修正;
+  endif
+
+  if (baseso非空) then (是)
+    :LoadDynamicSectionFromBaseSource;
+    :预取dynamic_count并计算base_dynamic_size;
+    :基准动态段按首个DT_NULL裁剪\n且终止前必须存在有效条目;
+    :候选全部无效时失败\n输出候选分类统计;
+  endif
+
+  :RebuildPhdr统一修正\np_filesz=p_memsz\np_paddr=p_vaddr\np_offset=p_vaddr;
+}
+
+partition "3）PT_LOAD装载与地址换算" {
+  :min_vaddr=PAGE_START(min(p_vaddr));
+  :max_vaddr=PAGE_START(max(p_vaddr+p_memsz+PAGE_SIZE-1));
+  :load_size=max_vaddr-min_vaddr;
+  :load_bias=load_start-min_vaddr;
+  :runtime_addr=load_bias+vaddr;
+  :按PT_LOAD把p_offset对应字节读入\nload_bias+p_vaddr;
+  :FindPhdr优先PT_PHDR\n兜底遍历全部offset=0的PT_LOAD\n并基于header_.e_phoff做溢出校验;
+}
+
+partition "4）Elf_Dyn与DT_*解析" {
+  :动态段可用性校验\n1）dyn_size>=sizeof(Elf_Dyn)\n2）区间不回绕\n3）完整落在PT_LOAD\n4）按首个DT_NULL终止\n5）终止前至少1条非DT_NULL;
+  :若已预取可用baseso动态段\n缺少DT_NULL按严格模式判不可用\n优先走回填路径;
+  :dyn_size=min(p_memsz,p_filesz)\n（p_filesz==0时用p_memsz）;
+  if (语义不可用且已预取baseso动态段) then (是)
+    :ApplyDynamicSection;
+    :修正PT_DYNAMIC\np_vaddr/p_paddr/p_offset=new_vaddr\np_memsz/p_filesz=dynamic_size;
+    :扩展末尾PT_LOAD覆盖动态段;
+    :再次执行可用性校验;
+  endif
+  :ReadSoInfo收集DT_*字段;
+  :DT_HASH两阶段校验\n先校验表头范围\n再按nbucket+nchain计算整表范围;
+  :范围校验按单个PT_LOAD逐段覆盖\n不接受段间空洞且不叠加padding;
+  :范围校验RangeInLoadSegments\n对齐校验BytesToCount\n指针校验PointerInLoadSegments\n通过后再转指针;
+  :组合约束\nDT_SYMTAB与DT_STRTAB必须成对\n重定位或HASH存在时必须有DT_SYMTAB;
+  :DT_JMPREL在PLTRELSZ为0时\n探测长度跟随DT_PLTREL\nREL用Elf_Rel\nRELA用Elf_Rela;
+  note right
+  关键映射
+  DT_HASH->hash
+  DT_SYMTAB->symtab
+  DT_STRTAB+DT_STRSZ->strtab
+  DT_RELA+DT_RELASZ->rela
+  DT_JMPREL+DT_PLTRELSZ+DT_PLTREL->plt rel
+  end note
+}
+
+partition "5）Elf_Rel/Elf_Rela重定位修正" {
+  if (dump_so_base_!=0) then (是)
+    :先校验r_offset写入区间\nRangeInLoadSegments(r_offset,sizeof(Elf_Addr))\n不允许段间空洞地址;
+    :相对重定位\nif(*target>=dump_base)\n*target-=dump_base;
+    :导入重定位\n优先符号索引映射槽位\n缺失时按顺序分配回退槽位;
+    :RELA相对项\n对特定类型按r_addend回写;
+  else (否)
+    :跳过重定位修正;
+  endif
+}
+
+partition "6）Elf_Shdr重建" {
+  :不修旧表，直接重建新节头;
+  :统一规则\nsh_offset=sh_addr\n按sh_addr排序\n同步修正sh_link;
+  :关键节\n.hash/.dynsym/.dynstr\n.rel.dyn/.rela.dyn/.rela.plt\n.dynamic/.data/.shstrtab;
+  :data起点=max_end(所有SHF_ALLOC节)\n若data起点>max_load则报错退出;
+  note right
+  典型公式
+  .hash size=(2+nbucket+nchain)*sizeof(Elf_Word)
+  .dynamic size=dynamic_count*sizeof(Elf_Dyn)
+  .data size=si.max_load-data_start
+  .shstrtab addr=si.max_load
+  end note
+}
+
+partition "7）RebuildFin拼装与回写" {
+  :输出布局\n[0,file_load_end)->镜像\n[file_load_end,shdr_off)->.shstrtab\n[shdr_off,...)->节头表;
+  :shdr_off=file_load_end+shstr_size;
+  :rebuild_size=file_load_end+shstr_size+shdr_bytes;
+  :逐节校验非NOBITS区间\n[sh_offset,sh_offset+sh_size)\n必须位于rebuild_size内;
+  :回写Elf_Ehdr\ne_type/e_shoff/e_shnum/e_shstrndx;
+}
+
+partition "8）libsgmainso.dump示例" {
+  :Elf_Ehdr\ne_shoff 0x212b30->0x223071\ne_shnum 25->13\ne_shstrndx 24->12;
+  :Elf_Phdr\nPT_LOAD[1].p_offset 0x202950->0x212950\nPT_DYNAMIC.p_offset 0x20ce80->0x21ce80;
+  :Elf_Dyn\n1条DT_NULL->33个槽位\nreadelf读取29条并在DT_NULL终止;
+  :输出大小\n0x223000+0x71+0x340=0x2233b1;
+}
+
+stop
+@enduml
